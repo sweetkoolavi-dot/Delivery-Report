@@ -1,0 +1,46 @@
+//@version=6
+indicator("Market Regime Companion — Trend + VIX", overlay=true, max_labels_count=100)
+
+benchmark = input.symbol("NSE:NIFTY", "Benchmark")
+vixSymbol = input.symbol("NSE:INDIAVIX", "India VIX")
+showBG    = input.bool(true, "Colour background by regime")
+
+bClose = request.security(benchmark, timeframe.period, close)
+vix    = request.security(vixSymbol, timeframe.period, close)
+
+ma20  = ta.sma(bClose, 20)
+ma50  = ta.sma(bClose, 50)
+ma200 = ta.sma(bClose, 200)
+r20   = ta.roc(bClose, 20)
+slope20 = ta.roc(ma20, 5)
+
+// 50-point fast companion score. Full breadth/industry score lives in the Streamlit system.
+trendScore = (bClose > ma20 ? 10 : 0) + (ma20 > ma50 ? 10 : 0) + (ma50 > ma200 ? 10 : 0) + (r20 > 0 ? 10 : 0) + (slope20 > 0 ? 10 : 0)
+
+vixRank = ta.percentrank(vix, 252)
+vix5 = ta.roc(vix, 5)
+warning = 0.0
+warning += bClose < ma20 ? 20 : 0
+warning += ma20 < ma50 ? 20 : 0
+warning += vix5 > 12 ? 25 : 0
+warning += vixRank > 75 ? 20 : 0
+warning := math.min(warning, 100)
+
+regime = trendScore >= 40 and warning < 35 ? "BULL" : trendScore >= 30 ? "SELECTIVE" : "DEFENSIVE"
+
+bg = regime == "BULL" ? color.new(color.green, 88) : regime == "SELECTIVE" ? color.new(color.orange, 88) : color.new(color.red, 88)
+bgcolor(showBG ? bg : na)
+
+plot(ma20, "Nifty 20 DMA", color=color.new(color.blue, 0), linewidth=1)
+plot(ma50, "Nifty 50 DMA", color=color.new(color.orange, 0), linewidth=1)
+
+var table dash = table.new(position.top_right, 2, 4, border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "Fast regime")
+    table.cell(dash, 1, 0, regime)
+    table.cell(dash, 0, 1, "Trend")
+    table.cell(dash, 1, 1, str.tostring(trendScore) + "/50")
+    table.cell(dash, 0, 2, "Warning")
+    table.cell(dash, 1, 2, str.tostring(math.round(warning)) + "/100")
+    table.cell(dash, 0, 3, "VIX")
+    table.cell(dash, 1, 3, str.tostring(vix, "#.##"))
