@@ -1,6 +1,7 @@
 import io
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 import altair as alt
 
-st.set_page_config(page_title='Market Regime Dashboard', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Market Intelligence Terminal v8', page_icon='📈', layout='wide')
 
 NIFTY500_CSV = 'https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv'
 NSE_EQUITY_LIST_CSV = 'https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv'
@@ -54,6 +55,63 @@ def classify_dashboard_state(score: float, warning: float):
     return 'ULTRA BEARISH', 'High-risk environment. Avoid aggressive longs.'
 
 
+def derive_sector(industry):
+    """Map detailed industry labels into stable broad sectors for easier comparison."""
+    if industry is None or (isinstance(industry, float) and np.isnan(industry)):
+        return np.nan
+    x = str(industry).strip()
+    if not x or x.lower() in {'nan','none','unknown'}:
+        return np.nan
+    u = x.upper()
+    rules = [
+        ('FINANCIAL SERVICES', ['BANK','FINANCE','FINANCIAL','INSURANCE','CAPITAL MARKET','ASSET MANAGEMENT','NBFC']),
+        ('INFORMATION TECHNOLOGY', ['INFORMATION TECHNOLOGY','SOFTWARE','IT SERVICES','COMPUTER']),
+        ('HEALTHCARE', ['PHARMA','HEALTHCARE','HOSPITAL','BIOTECH','DIAGNOSTIC']),
+        ('AUTOMOBILE & AUTO COMPONENTS', ['AUTOMOBILE','AUTO COMPONENT','TYRE']),
+        ('FMCG / CONSUMER', ['FMCG','FAST MOVING','FOOD PRODUCTS','BEVERAGE','HOUSEHOLD','PERSONAL PRODUCTS','CONSUMER DURABLE','CONSUMER SERVICES','RETAIL']),
+        ('CAPITAL GOODS / INDUSTRIALS', ['CAPITAL GOODS','INDUSTRIAL','ELECTRICAL EQUIPMENT','AEROSPACE','DEFENCE','ENGINEERING']),
+        ('CONSTRUCTION / REALTY', ['CONSTRUCTION','REALTY','REAL ESTATE','CEMENT','CONSTRUCTION MATERIAL']),
+        ('METALS & MINING', ['METAL','MINING','MINERALS','IRON','STEEL','ALUMIN']),
+        ('ENERGY / POWER', ['POWER','OIL','GAS','ENERGY','PETROLEUM','COAL']),
+        ('CHEMICALS', ['CHEMICAL','FERTILIZER','PESTICIDE']),
+        ('TELECOM', ['TELECOM']),
+        ('MEDIA', ['MEDIA','ENTERTAINMENT']),
+        ('TEXTILES', ['TEXTILE','APPAREL']),
+        ('SERVICES', ['SERVICES','LOGISTICS','TRANSPORT','TRAVEL']),
+    ]
+    for sector, keys in rules:
+        if any(k in u for k in keys):
+            return sector
+    return x
+
+
+def tradingview_url(symbol):
+    return f"https://www.tradingview.com/chart/?symbol=NSE%3A{quote(str(symbol).strip())}"
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def resolve_stock_profile(symbol: str):
+    """Resolve sector/industry only for shortlisted names; cached to protect broad-scan speed."""
+    try:
+        info = yf.Ticker(f'{symbol}.NS').get_info()
+        industry = info.get('industry') or np.nan
+        sector = info.get('sector') or derive_sector(industry)
+        return {'Symbol': symbol, 'Resolved Industry': industry, 'Resolved Sector': sector}
+    except Exception:
+        return {'Symbol': symbol, 'Resolved Industry': np.nan, 'Resolved Sector': np.nan}
+
+
+def enrich_profiles(symbols, workers=8):
+    symbols = list(dict.fromkeys(symbols))
+    rows=[]
+    with ThreadPoolExecutor(max_workers=min(workers, max(1,len(symbols)))) as ex:
+        futs={ex.submit(resolve_stock_profile,s):s for s in symbols}
+        for fut in as_completed(futs):
+            try: rows.append(fut.result())
+            except Exception: rows.append({'Symbol':futs[fut],'Resolved Industry':np.nan,'Resolved Sector':np.nan})
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_constituents():
     headers = {
@@ -73,7 +131,8 @@ def load_constituents():
     elif industry_col != 'Industry':
         df = df.rename(columns={industry_col: 'Industry'})
     df['Ticker'] = df['Symbol'].astype(str).str.strip() + '.NS'
-    return df[['Symbol', 'Ticker', 'Industry']].drop_duplicates('Ticker')
+    df['Sector'] = df['Industry'].map(derive_sector)
+    return df[['Symbol', 'Ticker', 'Sector', 'Industry']].drop_duplicates('Ticker')
 
 
 
@@ -94,11 +153,11 @@ def load_broad_nse_universe():
     eq['Symbol'] = eq[symbol_col].astype(str).str.strip()
     eq = eq[eq['Symbol'].ne('')].drop_duplicates('Symbol')
     eq['Ticker'] = eq['Symbol'] + '.NS'
-    n500 = load_constituents()[['Symbol','Industry']].drop_duplicates('Symbol')
+    n500 = load_constituents()[['Symbol','Sector','Industry']].drop_duplicates('Symbol')
     eq = eq.merge(n500, on='Symbol', how='left')
     # Industry is intentionally left missing outside Nifty 500 so broad stock discovery
     # does not pollute sector rankings with one giant "Other" bucket.
-    return eq[['Symbol','Ticker','Industry']].reset_index(drop=True)
+    return eq[['Symbol','Ticker','Sector','Industry']].reset_index(drop=True)
 
 
 @st.cache_data(ttl=20 * 60, show_spinner=False)
@@ -405,6 +464,7 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     avg20_turnover_cr = tail20.groupby('SYMBOL')['TURNOVER_LACS'].mean() / 100.0
     first20 = g.tail(22).groupby('SYMBOL').first()['CLOSE_PRICE']
     first5 = g.tail(6).groupby('SYMBOL').first()['CLOSE_PRICE']
+    prev_px = g.tail(2).groupby('SYMBOL').first()['CLOSE_PRICE']
     last_px = latest['CLOSE_PRICE']
 
     out = pd.DataFrame(index=last_px.index)
@@ -417,6 +477,8 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     out['5D Volume x'] = avg5_vol / avg20_vol.replace(0,np.nan)
     out['Volume Z'] = (latest['TTL_TRD_QNTY'] - avg20_vol) / std20_vol
     out['20D Avg Traded Value Cr'] = avg20_turnover_cr
+    out['Today Traded Value Cr'] = latest['TURNOVER_LACS'] / 100.0
+    out['Today % Change'] = (last_px / prev_px.replace(0,np.nan) - 1) * 100
     out['1M Price Change %'] = (last_px / first20 - 1) * 100
     out['5D Price Change %'] = (last_px / first5 - 1) * 100
 
@@ -449,7 +511,7 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     out['Volume Persistence 10D'] = tail10.groupby('SYMBOL')['vol_above'].sum()
 
     out = out[out['20D Avg Traded Value Cr'].fillna(0) >= float(min_traded_value_cr)]
-    out = out.reset_index().rename(columns={'SYMBOL':'Symbol'}).merge(meta[['Symbol','Industry']], on='Symbol', how='left')
+    out = out.reset_index().rename(columns={'SYMBOL':'Symbol'}).merge(meta[['Symbol','Sector','Industry']], on='Symbol', how='left')
 
     # Sector-relative strength where an industry mapping exists; unmapped broad-NSE names stay N/A.
     sector_ret = out.dropna(subset=['Industry']).groupby('Industry')['1M Price Change %'].median()
@@ -460,10 +522,13 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     d20p = percentile_series(out['20D Avg Delivery %'])
     dzp = percentile_series(out['Delivery Z'])
     vzp = percentile_series(out['Volume Z'])
+    tvp = percentile_series(out['Today Traded Value Cr'])
     rsp = percentile_series(out['RS vs N500 20D %'])
     rap = percentile_series(out['RS Acceleration'])
     persistp = percentile_series(out['Delivery Persistence 10D'] + out['Volume Persistence 10D'])
-    out['Accumulation Score'] = (0.22*d20p + 0.16*dzp + 0.18*vzp + 0.20*rsp + 0.12*rap + 0.12*persistp).round(1)
+    out['Participation Conviction'] = (0.25*dzp + 0.35*vzp + 0.25*tvp + 0.15*persistp).round(1)
+    # Delivery cannot dominate the score unless actual market participation is present.
+    out['Accumulation Score'] = (0.18*d20p + 0.10*dzp + 0.22*vzp + 0.15*tvp + 0.17*rsp + 0.10*rap + 0.08*persistp).round(1)
 
     def opportunity_type(r):
         rs20 = r.get('RS vs N500 20D %', -99)
@@ -473,17 +538,19 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
         d20 = r.get('20D Avg Delivery %', 0)
         p20 = r.get('1M Price Change %', -999)
         p5 = r.get('5D Price Change %', -999)
+        p0 = r.get('Today % Change', -999)
+        traded = r.get('Today Traded Value Cr', 0)
         near_high = r.get('Distance to 20D High %', -99) >= -3
         contraction = r.get('Volatility Contraction', 9) < 0.85
         if p5 < -2 and vz >= 1.5 and dz >= 1 and rs20 < 0:
             return '🔴 DISTRIBUTION RISK'
         if p20 > 15 or p5 > 8 or r.get('Price Extension vs 20DMA %', 0) > 10:
             return '🟠 EXTENDED'
-        if 0 <= p20 <= 7 and d20 >= 45 and dz >= 0.5 and vz >= 0.8 and rsa > 0:
+        if 0 <= p20 <= 7 and d20 >= 45 and dz >= 0.5 and vz >= 0.8 and rsa > 0 and traded >= 1:
             return '🟣 EARLY ACCUMULATION'
         if rs20 > 0 and rsa > 0 and near_high and contraction and d20 >= 40:
             return '🔵 SETUP READY'
-        if rs20 > 0 and rsa > 0 and near_high and r.get('Volume Spike x',0) >= 1.3 and dz >= 0:
+        if rs20 > 0 and rsa > 0 and near_high and r.get('Volume Spike x',0) >= 1.3 and dz >= 0 and traded >= 1:
             return '🟢 MOMENTUM ENTRY'
         if rs20 > 0 and rsa > 0:
             return '🟡 WATCH'
@@ -921,7 +988,7 @@ def add_entry_scores(df: pd.DataFrame):
             r.get('Extension Penalty', 99) <= 5 and
             r.get('Volume Spike x', 0) >= 1.0
         )
-        fundamental_ok = (not np.isfinite(fs)) or fs >= 6
+        fundamental_ok = (not np.isfinite(fs)) or fs >= 8
         if score >= 80 and supportive and fundamental_ok and ('EXTENDED' not in opp) and ('DISTRIBUTION' not in opp):
             return '⭐ BEST ENTRY SETUP'
         if score >= 70 and supportive and ('EXTENDED' not in opp):
@@ -970,7 +1037,7 @@ st.markdown('<div class="subtitle">Broad NSE discovery → market condition → 
 with st.sidebar:
     st.header('Settings')
     universe_mode = st.selectbox('Stock universe', ['Broad NSE EQ (~2,000)', 'Nifty 500 only'], index=0,
-                                help='Broad mode scans ordinary NSE EQ-series stocks. Sector labels are available where the stock maps to the Nifty 500 industry list.')
+                                help='Broad mode scans ordinary NSE EQ-series stocks. Nifty-500 names are mapped immediately; missing sector/industry labels for final candidates are resolved during the quality gate without slowing the broad scan.')
     max_stocks = st.slider('Maximum stocks to scan', 500, 2200, 2000, 100,
                            help='2,000 gives broad discovery. Broad mode uses cached NSE bhavcopy, so the scan remains light; reduce only if your connection is slow.')
     min_traded_value_cr = st.select_slider('Minimum 20D avg traded value (₹ Cr)', options=[0, 0.25, 0.5, 1, 2, 5, 10], value=1,
@@ -1013,8 +1080,14 @@ try:
             delivery_long = pd.DataFrame()
     else:
         meta = n500_meta
-        delivery_long = load_delivery_data(meta, lookback_days=delivery_lookback)
-        stock_rank = summarize_stock_delivery(delivery_long, close, volume, meta, d['benchmark_close'])
+        bhav_sessions = max(25, min(int(delivery_lookback), 35))
+        n500_bhav = load_broad_bhav_history(tuple(meta['Symbol'].tolist()), sessions=bhav_sessions)
+        stock_rank = broad_stock_summary(n500_bhav, meta, d['benchmark_close'], min_traded_value_cr=min_traded_value_cr)
+        if not n500_bhav.empty:
+            mapped_delivery = n500_bhav.merge(n500_meta[['Symbol','Industry']], left_on='SYMBOL', right_on='Symbol', how='inner')
+            delivery_long = mapped_delivery[['Date','SYMBOL','Industry','DELIV_PER']].rename(columns={'SYMBOL':'Symbol','DELIV_PER':'Delivery %'})
+        else:
+            delivery_long = pd.DataFrame()
 
     progress.progress(75, text='Building sector delivery and relative-strength views…')
     sector_pivot, sector_smooth, sector_rank = summarize_sector_delivery(delivery_long)
@@ -1022,6 +1095,12 @@ try:
     sector_opportunity = merge_sector_scores(sector_rank, sector_market_summary)
     progress.progress(100, text=f'Ready — {len(stock_rank):,} liquid stocks ranked')
     progress.empty()
+    if universe_mode.startswith('Broad') and 'broad_bhav' in locals() and not broad_bhav.empty:
+        latest_session = pd.to_datetime(broad_bhav['Date']).max().date()
+    elif 'n500_bhav' in locals() and not n500_bhav.empty:
+        latest_session = pd.to_datetime(n500_bhav['Date']).max().date()
+    else:
+        latest_session = None
 
     state_color = color_for_state(result.dashboard_state)
 
@@ -1042,7 +1121,10 @@ try:
         unsafe_allow_html=True,
     )
 
-    tabs = st.tabs(['Overview', 'Breadth', 'Sector Delivery + Volume', 'Sector Relative Strength', 'Sector Stocks', 'Accumulation Stocks', 'Stock News'])
+    if latest_session is not None:
+        st.caption(f'Latest NSE session used for current-day % change: {latest_session.strftime("%d %b %Y")}')
+
+    tabs = st.tabs(['Overview', 'Breadth', 'Industry Gain / Loss', 'Sector Delivery + Volume', 'Sector Relative Strength', 'Sector Stocks', 'Accumulation Stocks', 'Stock News'])
 
     with tabs[0]:
         # MARKET COMMAND CENTER
@@ -1058,7 +1140,9 @@ try:
         k5.metric('Actionable Candidates', f'{accumulation_stocks}', 'Score ≥ 70')
 
         st.markdown('#### Opportunity Funnel')
-        st.caption(f"Scanning {len(meta):,} NSE EQ-series stocks; sector analytics use stocks with available sector mapping, while stock-level RS/delivery/volume discovery covers the full loaded universe.")
+        mapped_count = int(stock_rank['Industry'].notna().sum()) if (not stock_rank.empty and 'Industry' in stock_rank.columns) else 0
+        mapped_pct = (mapped_count / len(stock_rank) * 100) if len(stock_rank) else 0
+        st.caption(f"Scanning {len(meta):,} NSE EQ-series stocks. {mapped_count:,} ranked stocks ({mapped_pct:.0f}%) already have industry mapping; missing labels for final candidates are resolved only at the quality gate to preserve speed.")
         f1, f2, f3, f4, f5 = st.columns(5)
         f1.metric('Universe', f'{len(stock_rank):,}' if not stock_rank.empty else '0')
         f2.metric('RS Positive', f'{positive_rs_stocks:,}')
@@ -1125,15 +1209,20 @@ try:
         # STOCK RADAR
         st.markdown('#### Stock Opportunity Radar')
         if not top_stock_df.empty:
-            stock_show = top_stock_df[['Symbol', 'Industry', 'Signal', 'Accumulation Score', 'Latest Delivery %', 'Volume Spike x', 'RS vs N500 20D %', 'RS vs N500 5D %', '1M Price Change %']].head(10)
-            st.dataframe(stock_show.style.format({
+            stock_show = top_stock_df.copy().head(10)
+            stock_show['TradingView'] = stock_show['Symbol'].map(tradingview_url)
+            radar_cols = ['Symbol','Sector','Industry','Signal','Accumulation Score','Participation Conviction','Today % Change','Today Traded Value Cr','Latest Delivery %','Volume Spike x','RS vs N500 20D %','RS vs N500 5D %','TradingView']
+            radar_cols = [c for c in radar_cols if c in stock_show.columns]
+            st.dataframe(stock_show[radar_cols].style.format({
                 'Accumulation Score': '{:.0f}',
+                'Participation Conviction': '{:.0f}',
+                'Today % Change': '{:+.2f}',
+                'Today Traded Value Cr': '{:.1f}',
                 'Latest Delivery %': '{:.1f}',
                 'Volume Spike x': '{:.2f}x',
                 'RS vs N500 20D %': '{:+.2f}',
                 'RS vs N500 5D %': '{:+.2f}',
-                '1M Price Change %': '{:+.2f}',
-            }), use_container_width=True, hide_index=True)
+            }), use_container_width=True, hide_index=True, column_config={'TradingView': st.column_config.LinkColumn('TradingView', display_text='Open chart')})
         else:
             st.info('Stock opportunity data is not available yet.')
 
@@ -1181,6 +1270,34 @@ try:
         st.caption('Both lines are rebased to 100. If the index rises while breadth weakens, internals are deteriorating.')
 
     with tabs[2]:
+        st.subheader('Industry-wise gain / loss')
+        st.caption('Median current-session price change by industry. Median is used so one very large stock does not distort the whole industry.')
+        mapped_now = stock_rank.dropna(subset=['Industry']).copy() if not stock_rank.empty else pd.DataFrame()
+        if mapped_now.empty or 'Today % Change' not in mapped_now.columns:
+            st.warning('Industry performance could not be prepared from the current scan.')
+        else:
+            industry_perf = mapped_now.groupby('Industry').agg(
+                Stocks=('Symbol','count'),
+                Today_Median=('Today % Change','median'),
+                Advancers=('Today % Change', lambda x: (x > 0).mean()*100),
+                Traded_Value_Cr=('Today Traded Value Cr','sum'),
+                Avg_Delivery=('Latest Delivery %','mean'),
+                Avg_Volume_Spike=('Volume Spike x','mean'),
+            ).reset_index()
+            industry_perf = industry_perf[industry_perf['Stocks'] >= 2].sort_values('Today_Median', ascending=False)
+            top_count = st.slider('Industries to display', 10, min(40, max(10,len(industry_perf))), min(25,max(10,len(industry_perf))), 5, key='ind_count') if len(industry_perf) >= 10 else len(industry_perf)
+            chart_df = pd.concat([industry_perf.head(max(1,top_count//2)), industry_perf.tail(max(1,top_count//2))]).drop_duplicates('Industry')
+            chart = alt.Chart(chart_df).mark_bar(cornerRadiusEnd=4).encode(
+                y=alt.Y('Industry:N', sort='-x', title=None),
+                x=alt.X('Today_Median:Q', title='Median current-session change (%)'),
+                color=alt.condition(alt.datum.Today_Median >= 0, alt.value('#22c55e'), alt.value('#ef4444')),
+                tooltip=['Industry:N', alt.Tooltip('Today_Median:Q', format='+.2f', title='Today %'), alt.Tooltip('Advancers:Q', format='.0f', title='Advancers %'), alt.Tooltip('Traded_Value_Cr:Q', format='.1f', title='Traded value ₹Cr')]
+            ).properties(height=max(420, 25*len(chart_df)))
+            st.altair_chart(chart, use_container_width=True)
+            show = industry_perf.rename(columns={'Today_Median':'Today Median %','Advancers':'Advancers %','Traded_Value_Cr':'Today Traded Value ₹Cr','Avg_Delivery':'Avg Delivery %','Avg_Volume_Spike':'Avg Volume Spike x'})
+            st.dataframe(show.style.format({'Today Median %':'{:+.2f}','Advancers %':'{:.0f}','Today Traded Value ₹Cr':'{:.1f}','Avg Delivery %':'{:.1f}','Avg Volume Spike x':'{:.2f}x'}), use_container_width=True, hide_index=True)
+
+    with tabs[3]:
         st.subheader('Sector delivery + volume activity')
         st.caption('Delivery is smoothed with a 5 DMA. Volume uses a value-traded proxy, so a sector with only a small price move can still stand out when activity surges.')
         if sector_smooth.empty:
@@ -1188,9 +1305,21 @@ try:
         else:
             default_sectors = sector_opportunity.head(top_sector_count).index.tolist() if not sector_opportunity.empty else sector_rank.head(top_sector_count).index.tolist()
             selected = st.multiselect('Select sectors to display', options=sector_smooth.columns.tolist(), default=default_sectors, key='delivery_sectors')
-            scale_choice = st.radio('Delivery chart scale', ['Linear', 'Logarithmic'], horizontal=True, key='delivery_scale')
+            delivery_measure = st.radio('Delivery measurement', ['Excess vs 20D average (pp)', '5 DMA Delivery %', 'Delivery Z-score'], horizontal=True, key='delivery_measure')
             if selected:
-                line_chart_with_scale(sector_smooth[selected].dropna(how='all'), '5 DMA Delivery %', log_scale=(scale_choice == 'Logarithmic'))
+                raw = sector_pivot[selected].copy()
+                if delivery_measure == 'Excess vs 20D average (pp)':
+                    frame = raw.rolling(5).mean() - raw.rolling(20).mean()
+                    line_chart_with_scale(frame.dropna(how='all'), 'Delivery excess vs 20D average (percentage points)', log_scale=False)
+                    st.caption('Above zero = sector delivery is running above its own 20-day normal. This removes the 40–60% compression seen in raw delivery lines.')
+                elif delivery_measure == 'Delivery Z-score':
+                    mu = raw.rolling(20).mean(); sd = raw.rolling(20).std().replace(0,np.nan)
+                    frame = (raw.rolling(5).mean() - mu) / sd
+                    line_chart_with_scale(frame.dropna(how='all'), 'Delivery Z-score', log_scale=False)
+                    st.caption('Positive Z-score = unusually high delivery for that sector relative to its own recent history.')
+                else:
+                    scale_choice = st.radio('Raw delivery scale', ['Linear', 'Logarithmic'], horizontal=True, key='delivery_scale')
+                    line_chart_with_scale(sector_smooth[selected].dropna(how='all'), '5 DMA Delivery %', log_scale=(scale_choice == 'Logarithmic'))
             else:
                 st.info('Choose one or more sectors to display the delivery chart.')
 
@@ -1213,7 +1342,7 @@ try:
 
             st.caption('Interpretation: a sector can rank highly even with a modest price move if delivery is persistently high, turnover/volume is expanding, and RS versus NIFTY 500 is improving.')
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader('Sector relative strength vs NIFTY 500')
         st.caption('Each line is an equal-weight sector index divided by NIFTY 500 and rebased to 100. Rising line = sector is strengthening relative to the market.')
         if sector_rs5.empty:
@@ -1227,9 +1356,14 @@ try:
                 st.caption('All sectors selected. Use zoom/pan on the chart if the lines overlap.')
             else:
                 rs_selected = st.multiselect('Select sectors for RS chart', options=sector_rs5.columns.tolist(), default=default_rs, key='rs_sectors')
-            rs_scale = st.radio('RS chart scale', ['Linear', 'Logarithmic'], horizontal=True, key='rs_scale')
+            rs_window = st.radio('RS comparison window', [20, 60, 130], horizontal=True, index=1, key='rs_window')
             if rs_selected:
-                line_chart_with_scale(sector_rs5[rs_selected].tail(130).dropna(how='all'), 'Relative Strength Index', log_scale=(rs_scale == 'Logarithmic'))
+                raw_rs = sector_rs5[rs_selected].tail(int(rs_window)).dropna(how='all')
+                if not raw_rs.empty:
+                    base = raw_rs.apply(lambda c: c.dropna().iloc[0] if c.notna().any() else np.nan)
+                    rs_perf = (raw_rs.divide(base, axis=1) - 1.0) * 100.0
+                    line_chart_with_scale(rs_perf, 'Relative performance vs NIFTY 500 (%)', log_scale=False)
+                    st.caption('0% is the start of the selected window. +3% means the sector has outperformed NIFTY 500 by about 3 percentage points over that window; negative values mean underperformance.')
 
             rs_table = sector_opportunity.reset_index().rename(columns={'index': 'Industry'})
             rs_cols = ['Industry', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', '5D Avg Delivery %', 'Sector Opportunity Score']
@@ -1242,7 +1376,7 @@ try:
                 'Sector Opportunity Score': '{:.1f}',
             }), use_container_width=True, hide_index=True)
 
-    with tabs[4]:
+    with tabs[5]:
         st.subheader('Stocks inside a selected sector')
         st.caption('Use the sector RS chart first, then drill into the stocks whose delivery, volume and stock-level RS are strengthening.')
         if stock_rank.empty:
@@ -1252,9 +1386,12 @@ try:
             chosen_sector = st.selectbox('Choose sector', options=sector_options, key='sector_drilldown')
             sector_stocks = stock_rank[stock_rank['Industry'] == chosen_sector].copy()
             sector_stocks = sector_stocks.sort_values(['Accumulation Score', 'Volume Spike x'], ascending=False)
-            show_cols = ['Symbol', 'Signal', 'Accumulation Score', 'Latest Delivery %', '20D Avg Delivery %', 'Volume Spike x', '5D Volume x', 'RS vs N500 20D %', 'RS vs N500 5D %', '1M Price Change %', '5D Price Change %']
+            sector_stocks['TradingView'] = sector_stocks['Symbol'].map(tradingview_url)
+            show_cols = ['Symbol', 'Signal', 'Accumulation Score', 'Today % Change', 'Today Traded Value Cr', 'Latest Delivery %', '20D Avg Delivery %', 'Volume Spike x', '5D Volume x', 'RS vs N500 20D %', 'RS vs N500 5D %', '1M Price Change %', '5D Price Change %', 'TradingView']
             st.dataframe(sector_stocks[show_cols].style.format({
                 'Accumulation Score': '{:.1f}',
+                'Today % Change': '{:+.2f}',
+                'Today Traded Value Cr': '{:.1f}',
                 'Latest Delivery %': '{:.1f}',
                 '20D Avg Delivery %': '{:.1f}',
                 'Volume Spike x': '{:.2f}x',
@@ -1263,10 +1400,11 @@ try:
                 'RS vs N500 5D %': '{:+.2f}',
                 '1M Price Change %': '{:+.2f}',
                 '5D Price Change %': '{:+.2f}',
-            }), use_container_width=True, hide_index=True)
+            }), use_container_width=True, hide_index=True, column_config={'TradingView': st.column_config.LinkColumn('TradingView', display_text='Open chart')})
 
             if not sector_stocks.empty:
                 stock_choice = st.selectbox('View stock RS chart', options=sector_stocks['Symbol'].head(50).tolist(), key='stock_rs_choice')
+                st.link_button('Open TradingView chart', tradingview_url(stock_choice), use_container_width=False)
                 ticker = f'{stock_choice}.NS'
                 if ticker in close.columns:
                     stock_px = close[ticker].dropna()
@@ -1276,7 +1414,7 @@ try:
                     rs_line = rs_line.rolling(5).mean().rename(stock_choice).to_frame().tail(130)
                     line_chart_with_scale(rs_line, 'Stock RS vs NIFTY 500', log_scale=False, height=320)
 
-    with tabs[5]:
+    with tabs[6]:
         st.subheader('Opportunity Funnel — accumulation to entry')
         st.caption('Fast scan first, deeper checks later. The expensive Piotroski/news layer only runs on the final shortlist so broad NSE speed is preserved.')
         if stock_rank.empty:
@@ -1287,6 +1425,7 @@ try:
             stage2 = stage1[
                 (stage1['20D Avg Delivery %'] >= 40) &
                 (stage1['Volume Spike x'] >= 1.0) &
+                (stage1['Today Traded Value Cr'] >= float(min_traded_value_cr)) &
                 (stage1['RS vs N500 20D %'] > 0)
             ].copy()
             stage3 = stage2[
@@ -1298,7 +1437,7 @@ try:
             fc1.metric('Stage 1 · Liquid universe', f'{len(stage1):,}')
             fc2.metric('Stage 2 · Participation + RS', f'{len(stage2):,}')
             fc3.metric('Stage 3 · Quality setups', f'{len(stage3):,}')
-            fc4.metric('Entry Ready', f"{int(stage3['Entry View'].isin(['⭐ BEST ENTRY SETUP','🟢 ENTRY READY']).sum())}")
+            fc4.metric('Technical finalists', f'{len(stage3):,}')
 
             f1, f2, f3, f4 = st.columns(4)
             min_delivery = f1.slider('Minimum 20D delivery %', 20, 80, 40, 5)
@@ -1306,80 +1445,89 @@ try:
             rs_only = f3.checkbox('Only positive 20D RS', value=True)
             only_actionable = f4.checkbox('Hide extended/distribution', value=True)
 
-            filtered = stock_rank[(stock_rank['20D Avg Delivery %'] >= min_delivery) & (stock_rank['Volume Spike x'] >= min_volume)].copy()
+            filtered = stock_rank[(stock_rank['20D Avg Delivery %'] >= min_delivery) & (stock_rank['Volume Spike x'] >= min_volume) & (stock_rank['Today Traded Value Cr'] >= float(min_traded_value_cr))].copy()
             if rs_only:
                 filtered = filtered[filtered['RS vs N500 20D %'] > 0]
             if only_actionable:
                 filtered = filtered[~filtered['Opportunity Type'].astype(str).str.contains('EXTENDED|DISTRIBUTION', regex=True)]
             filtered = add_entry_scores(filtered)
 
-            st.markdown('#### Best entry candidates')
-            ready = filtered[filtered['Entry View'].isin(['⭐ BEST ENTRY SETUP','🟢 ENTRY READY'])].head(5)
-            if not ready.empty:
-                cards = st.columns(min(5, len(ready)))
-                for i, (_, r) in enumerate(ready.iterrows()):
-                    with cards[i]:
-                        st.metric(r['Symbol'], f"{r['Entry Suitability Score']:.0f}/100")
-                        st.caption(f"{r['Entry View']} · {r.get('Opportunity Type','')} · DelZ {r.get('Delivery Z',np.nan):+.1f} · VolZ {r.get('Volume Z',np.nan):+.1f}")
-                        st.caption(f"RS20 {r['RS vs N500 20D %']:+.1f}% · RS accel {r.get('RS Acceleration',np.nan):+.1f}% · High {r.get('Distance to 20D High %',np.nan):+.1f}%")
-            else:
-                st.info('No stock currently meets the strict Entry Ready conditions. The scanner is designed to return nothing rather than force a mediocre entry.')
+            st.markdown('#### Technical pre-screen')
+            st.caption('These are not final actionable stocks yet. Final names appear only after the Piotroski 8–9 quality gate below.')
+            st.metric('Technical candidates awaiting fundamental gate', f'{len(filtered):,}')
 
             type_counts = filtered['Opportunity Type'].value_counts().rename_axis('Opportunity Type').reset_index(name='Stocks')
             st.markdown('#### Opportunity mix')
             st.dataframe(type_counts, use_container_width=True, hide_index=True)
 
-            st.markdown('#### Piotroski fundamental check — final shortlist only')
+            st.markdown('#### Final quality gate — Piotroski 8 or 9 only')
+            st.caption('To preserve speed, fundamentals and missing sector/industry labels are fetched only for the final technical shortlist. The actionable table below keeps only F-Score 8–9 stocks.')
             cpi1, cpi2 = st.columns([2,1])
-            pi_count = cpi1.slider('Candidates to enrich with Piotroski F-Score', 5, 25, 10, 5)
-            load_pi = cpi2.button('Load Piotroski scores', use_container_width=True)
-            if 'piotroski_scores' not in st.session_state:
-                st.session_state['piotroski_scores'] = pd.DataFrame()
+            pi_count = cpi1.slider('Candidates to run through final quality gate', 5, 30, 15, 5)
+            load_pi = cpi2.button('Run final quality gate', use_container_width=True)
+            if 'final_quality_data' not in st.session_state:
+                st.session_state['final_quality_data'] = pd.DataFrame()
             if load_pi and not filtered.empty:
-                with st.spinner(f'Loading annual fundamentals for top {pi_count} candidates...'):
-                    pio = enrich_piotroski(filtered.head(pi_count)['Symbol'].tolist())
-                    st.session_state['piotroski_scores'] = pio
+                symbols = filtered.head(pi_count)['Symbol'].tolist()
+                with st.spinner(f'Checking Piotroski + sector/industry for top {len(symbols)} candidates...'):
+                    pio = enrich_piotroski(symbols)
+                    prof = enrich_profiles(symbols)
+                    quality = pio.merge(prof, on='Symbol', how='outer')
+                    st.session_state['final_quality_data'] = quality
 
-            pio = st.session_state.get('piotroski_scores', pd.DataFrame())
-            if isinstance(pio, pd.DataFrame) and not pio.empty:
-                filtered = filtered.drop(columns=['Piotroski F-Score','F-Score Coverage'], errors='ignore').merge(pio, on='Symbol', how='left')
+            quality = st.session_state.get('final_quality_data', pd.DataFrame())
+            if isinstance(quality, pd.DataFrame) and not quality.empty:
+                filtered = filtered.drop(columns=['Piotroski F-Score','F-Score Coverage'], errors='ignore').merge(quality, on='Symbol', how='inner')
+                # Fill missing broad-universe classification only at the final, actionable stage.
+                filtered['Industry'] = filtered['Industry'].where(filtered['Industry'].notna(), filtered.get('Resolved Industry'))
+                filtered['Sector'] = filtered['Sector'].where(filtered['Sector'].notna(), filtered.get('Resolved Sector'))
+                filtered = filtered[filtered['Piotroski F-Score'] > 7].copy()
                 filtered = add_entry_scores(filtered)
+                filtered['TradingView'] = filtered['Symbol'].map(tradingview_url)
             else:
-                filtered['Piotroski F-Score'] = np.nan
-                filtered['F-Score Coverage'] = 0
+                filtered = pd.DataFrame()
+                st.info('Run the final quality gate to see actionable stocks. Only Piotroski 8–9 candidates will be retained.')
 
-            top_n = st.slider('Rows to display', 10, 100, 30, 5, key='accum_rows')
-            preferred = [
-                'Entry View','Opportunity Type','Symbol','Industry','Entry Suitability Score','Piotroski F-Score','F-Score Coverage',
-                'Accumulation Score','Latest Delivery %','20D Avg Delivery %','Delivery Z','Delivery Acceleration',
-                'Volume Spike x','Volume Z','5D Volume x','Delivery Persistence 10D','Volume Persistence 10D',
-                'RS vs N500 20D %','RS vs N500 5D %','RS Acceleration','RS vs Sector 20D %',
-                'Distance to 20D High %','Price Extension vs 20DMA %','Volatility Contraction',
-                '1M Price Change %','5D Price Change %','Extension Penalty'
-            ]
-            show_cols = [c for c in preferred if c in filtered.columns]
-            display_df = filtered[show_cols].head(top_n).copy()
-            fmt = {
-                'Entry Suitability Score':'{:.1f}','Accumulation Score':'{:.1f}',
-                'Latest Delivery %':'{:.1f}','20D Avg Delivery %':'{:.1f}','Delivery Z':'{:+.2f}',
-                'Delivery Acceleration':'{:+.1f}','Volume Spike x':'{:.2f}x','Volume Z':'{:+.2f}','5D Volume x':'{:.2f}x',
-                'RS vs N500 20D %':'{:+.2f}','RS vs N500 5D %':'{:+.2f}','RS Acceleration':'{:+.2f}',
-                'RS vs Sector 20D %':'{:+.2f}','Distance to 20D High %':'{:+.2f}','Price Extension vs 20DMA %':'{:+.2f}',
-                'Volatility Contraction':'{:.2f}x','1M Price Change %':'{:+.2f}','5D Price Change %':'{:+.2f}','Extension Penalty':'{:.0f}'
-            }
-            fmt['Piotroski F-Score'] = lambda x: 'N/A' if pd.isna(x) else f'{x:.0f}/9'
-            st.dataframe(display_df.style.format({k:v for k,v in fmt.items() if k in display_df.columns}), use_container_width=True, hide_index=True)
+            if not filtered.empty:
+                st.success(f"{len(filtered)} candidate(s) passed Piotroski ≥ 8 and the technical/participation filters.")
+                top_n = st.slider('Rows to display', 5, 50, min(20, max(5,len(filtered))), 5, key='accum_rows')
+                preferred = [
+                    'Entry View','Opportunity Type','Symbol','Sector','Industry','Entry Suitability Score','Piotroski F-Score','F-Score Coverage',
+                    'Accumulation Score','Participation Conviction','Today % Change','Today Traded Value Cr','Latest Delivery %','20D Avg Delivery %','Delivery Z','Delivery Acceleration',
+                    'Volume Spike x','Volume Z','5D Volume x','Delivery Persistence 10D','Volume Persistence 10D',
+                    'RS vs N500 20D %','RS vs N500 5D %','RS Acceleration','RS vs Sector 20D %',
+                    'Distance to 20D High %','Price Extension vs 20DMA %','Volatility Contraction',
+                    '1M Price Change %','5D Price Change %','Extension Penalty','TradingView'
+                ]
+                show_cols = [c for c in preferred if c in filtered.columns]
+                display_df = filtered[show_cols].head(top_n).copy()
+                fmt = {
+                    'Entry Suitability Score':'{:.1f}','Accumulation Score':'{:.1f}','Participation Conviction':'{:.1f}',
+                    'Today % Change':'{:+.2f}','Today Traded Value Cr':'{:.1f}',
+                    'Latest Delivery %':'{:.1f}','20D Avg Delivery %':'{:.1f}','Delivery Z':'{:+.2f}',
+                    'Delivery Acceleration':'{:+.1f}','Volume Spike x':'{:.2f}x','Volume Z':'{:+.2f}','5D Volume x':'{:.2f}x',
+                    'RS vs N500 20D %':'{:+.2f}','RS vs N500 5D %':'{:+.2f}','RS Acceleration':'{:+.2f}',
+                    'RS vs Sector 20D %':'{:+.2f}','Distance to 20D High %':'{:+.2f}','Price Extension vs 20DMA %':'{:+.2f}',
+                    'Volatility Contraction':'{:.2f}x','1M Price Change %':'{:+.2f}','5D Price Change %':'{:+.2f}','Extension Penalty':'{:.0f}'
+                }
+                fmt['Piotroski F-Score'] = lambda x: 'N/A' if pd.isna(x) else f'{x:.0f}/9'
+                st.dataframe(display_df.style.format({k:v for k,v in fmt.items() if k in display_df.columns}), use_container_width=True, hide_index=True,
+                             column_config={'TradingView': st.column_config.LinkColumn('TradingView', display_text='Open chart')})
+                chart_pick = st.selectbox('TradingView / detailed chart stock', options=filtered['Symbol'].head(30).tolist(), key='accum_chart_pick')
+                st.link_button('Open selected stock in TradingView', tradingview_url(chart_pick))
+
+                early = filtered[filtered['Opportunity Type'] == '🟣 EARLY ACCUMULATION'].head(10)
+                setup = filtered[filtered['Opportunity Type'] == '🔵 SETUP READY'].head(10)
+                if not early.empty:
+                    st.success('Early accumulation: ' + ', '.join(early['Symbol'].tolist()))
+                if not setup.empty:
+                    st.info('Setup ready: ' + ', '.join(setup['Symbol'].tolist()))
 
             st.caption('Key interpretation: positive Delivery/Volume Z means activity is unusually high for that stock; RS Acceleration identifies improving leadership; values below 1.0 in Volatility Contraction indicate short-term volatility is contracting versus its 20-day norm. Piotroski is confirmation, not the trigger.')
 
-            early = filtered[filtered['Opportunity Type'] == '🟣 EARLY ACCUMULATION'].head(10)
-            setup = filtered[filtered['Opportunity Type'] == '🔵 SETUP READY'].head(10)
-            if not early.empty:
-                st.success('Early accumulation: ' + ', '.join(early['Symbol'].tolist()))
-            if not setup.empty:
-                st.info('Setup ready: ' + ', '.join(setup['Symbol'].tolist()))
 
-    with tabs[6]:
+
+    with tabs[7]:
         st.subheader('Stock news support')
         st.caption('Use news as confirmation, not as a substitute for the delivery + volume + RS signal.')
         if stock_rank.empty:
@@ -1390,12 +1538,13 @@ try:
             chosen_row = stock_rank[stock_rank['Symbol'] == chosen_symbol].head(1)
             if not chosen_row.empty:
                 info_cols = st.columns(5)
-                info_cols[0].metric('Sector', chosen_row['Industry'].iloc[0])
+                info_cols[0].metric('Sector / Industry', chosen_row['Sector'].iloc[0] if ('Sector' in chosen_row.columns and pd.notna(chosen_row['Sector'].iloc[0])) else chosen_row['Industry'].iloc[0])
                 info_cols[1].metric('Delivery', f"{chosen_row['Latest Delivery %'].iloc[0]:.1f}%")
                 info_cols[2].metric('Volume Spike', f"{chosen_row['Volume Spike x'].iloc[0]:.2f}x")
                 info_cols[3].metric('RS 20D', f"{chosen_row['RS vs N500 20D %'].iloc[0]:+.2f}%")
                 info_cols[4].metric('Accumulation', f"{chosen_row['Accumulation Score'].iloc[0]:.1f}")
                 st.write(f"**Signal:** {chosen_row['Signal'].iloc[0]}")
+                st.link_button('Open TradingView chart', tradingview_url(chosen_symbol))
             with st.spinner('Loading news...'):
                 news_rows = fetch_stock_news(chosen_symbol)
             if not news_rows:
