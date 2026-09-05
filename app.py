@@ -1,7 +1,9 @@
 import io
+import json
+import re
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import numpy as np
 import pandas as pd
@@ -9,8 +11,10 @@ import requests
 import streamlit as st
 import yfinance as yf
 import altair as alt
+from bs4 import BeautifulSoup
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
-st.set_page_config(page_title='Market Intelligence Terminal v8', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Market Intelligence Terminal v9', page_icon='📈', layout='wide')
 
 NIFTY500_CSV = 'https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv'
 NSE_EQUITY_LIST_CSV = 'https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv'
@@ -89,27 +93,155 @@ def tradingview_url(symbol):
     return f"https://www.tradingview.com/chart/?symbol=NSE%3A{quote(str(symbol).strip())}"
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
+MONEYCONTROL_SUGGEST = 'https://www.moneycontrol.com/mccode/common/autosuggestion_solr.php'
+
+
+def _clean_label(x):
+    if x is None:
+        return np.nan
+    val = str(x).strip()
+    if not val or val.lower() in {'nan','none','unknown','n/a','na','-'}:
+        return np.nan
+    return val
+
+
+def _parse_moneycontrol_jsonp(text):
+    text = (text or '').strip()
+    if not text:
+        return []
+    if text.startswith('['):
+        try:
+            return json.loads(text)
+        except Exception:
+            return []
+    m = re.search(r'\((.*)\)\s*;?$', text, flags=re.S)
+    if not m:
+        return []
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return []
+
+
+def _moneycontrol_profile(symbol: str):
+    """Best-effort Moneycontrol fallback for classification; used only after faster sources fail."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json,text/html,*/*',
+    }
+    try:
+        params = {'classic':'true','query':symbol,'type':'1','format':'json','callback':'suggest1'}
+        r = requests.get(MONEYCONTROL_SUGGEST, params=params, headers=headers, timeout=8)
+        candidates = _parse_moneycontrol_jsonp(r.text)
+        if not isinstance(candidates, list) or not candidates:
+            return np.nan, np.nan
+
+        def score_item(obj):
+            vals = ' '.join(str(obj.get(k,'')) for k in ['nse_code','symbol','stock_name','company_name','name']).upper()
+            return 2 if symbol.upper() in vals.split() else (1 if symbol.upper() in vals else 0)
+        objects = [x for x in candidates if isinstance(x,dict)]
+        if not objects:
+            return np.nan, np.nan
+        item = sorted(objects, key=score_item, reverse=True)[0]
+        industry = np.nan
+        sector = np.nan
+        for k,v in item.items():
+            kl = str(k).lower()
+            if pd.isna(industry) and 'industry' in kl:
+                industry = _clean_label(v)
+            if pd.isna(sector) and 'sector' in kl:
+                sector = _clean_label(v)
+        if pd.notna(industry) or pd.notna(sector):
+            if pd.isna(sector):
+                sector = derive_sector(industry)
+            return industry, sector
+
+        link = item.get('link_src') or item.get('link') or item.get('url')
+        if not link:
+            return np.nan, np.nan
+        page_url = urljoin('https://www.moneycontrol.com', str(link))
+        page = requests.get(page_url, headers=headers, timeout=10)
+        soup = BeautifulSoup(page.text, 'html.parser')
+        plain = ' '.join(soup.stripped_strings)
+        patterns = {
+            'industry': [r'Industry\s*[:\-]?\s*([A-Za-z0-9 &/().,+\-]{3,90})',
+                         r'Basic Industry\s*[:\-]?\s*([A-Za-z0-9 &/().,+\-]{3,90})'],
+            'sector': [r'Sector\s*[:\-]?\s*([A-Za-z0-9 &/().,+\-]{3,90})']
+        }
+        for rgx in patterns['industry']:
+            m = re.search(rgx, plain, flags=re.I)
+            if m:
+                industry = _clean_label(m.group(1).split('Market Cap')[0].strip())
+                break
+        for rgx in patterns['sector']:
+            m = re.search(rgx, plain, flags=re.I)
+            if m:
+                sector = _clean_label(m.group(1).split('Industry')[0].strip())
+                break
+        if pd.isna(sector) and pd.notna(industry):
+            sector = derive_sector(industry)
+        return industry, sector
+    except Exception:
+        return np.nan, np.nan
+
+
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
 def resolve_stock_profile(symbol: str):
-    """Resolve sector/industry only for shortlisted names; cached to protect broad-scan speed."""
+    """Layered resolver: Yahoo structured profile, then Moneycontrol fallback."""
+    industry = np.nan
+    sector = np.nan
+    source = np.nan
     try:
         info = yf.Ticker(f'{symbol}.NS').get_info()
-        industry = info.get('industry') or np.nan
-        sector = info.get('sector') or derive_sector(industry)
-        return {'Symbol': symbol, 'Resolved Industry': industry, 'Resolved Sector': sector}
+        industry = _clean_label(info.get('industry'))
+        sector = _clean_label(info.get('sector'))
+        if pd.isna(sector) and pd.notna(industry):
+            sector = derive_sector(industry)
+        if pd.notna(industry) or pd.notna(sector):
+            source = 'Yahoo Finance'
     except Exception:
-        return {'Symbol': symbol, 'Resolved Industry': np.nan, 'Resolved Sector': np.nan}
+        pass
+    if pd.isna(industry) or pd.isna(sector):
+        mc_industry, mc_sector = _moneycontrol_profile(symbol)
+        if pd.isna(industry) and pd.notna(mc_industry):
+            industry = mc_industry
+        if pd.isna(sector) and pd.notna(mc_sector):
+            sector = mc_sector
+        if pd.notna(mc_industry) or pd.notna(mc_sector):
+            source = 'Moneycontrol' if pd.isna(source) else 'Yahoo + Moneycontrol'
+    return {'Symbol': symbol, 'Resolved Industry': industry, 'Resolved Sector': sector, 'Resolved Source': source}
 
 
-def enrich_profiles(symbols, workers=8):
+def enrich_profiles(symbols, workers=10):
     symbols = list(dict.fromkeys(symbols))
     rows=[]
+    if not symbols:
+        return pd.DataFrame(columns=['Symbol','Resolved Industry','Resolved Sector','Resolved Source'])
     with ThreadPoolExecutor(max_workers=min(workers, max(1,len(symbols)))) as ex:
         futs={ex.submit(resolve_stock_profile,s):s for s in symbols}
         for fut in as_completed(futs):
-            try: rows.append(fut.result())
-            except Exception: rows.append({'Symbol':futs[fut],'Resolved Industry':np.nan,'Resolved Sector':np.nan})
+            try:
+                rows.append(fut.result())
+            except Exception:
+                rows.append({'Symbol':futs[fut],'Resolved Industry':np.nan,'Resolved Sector':np.nan,'Resolved Source':np.nan})
     return pd.DataFrame(rows)
+
+
+def apply_profile_enrichment(df: pd.DataFrame, profiles: pd.DataFrame):
+    if df.empty or profiles is None or profiles.empty:
+        return df
+    out = df.drop(columns=['Resolved Industry','Resolved Sector','Resolved Source'], errors='ignore').merge(profiles, on='Symbol', how='left')
+    if 'Industry' not in out.columns:
+        out['Industry'] = np.nan
+    if 'Sector' not in out.columns:
+        out['Sector'] = np.nan
+    out['Industry'] = out['Industry'].where(out['Industry'].notna(), out['Resolved Industry'])
+    out['Sector'] = out['Sector'].where(out['Sector'].notna(), out['Resolved Sector'])
+    if 'Classification Source' not in out.columns:
+        out['Classification Source'] = np.nan
+    out['Classification Source'] = out['Classification Source'].where(out['Classification Source'].notna(), out['Resolved Source'])
+    out['Sector'] = out['Sector'].where(out['Sector'].notna(), out['Industry'].map(derive_sector))
+    return out.drop(columns=['Resolved Industry','Resolved Sector','Resolved Source'], errors='ignore')
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -132,9 +264,42 @@ def load_constituents():
         df = df.rename(columns={industry_col: 'Industry'})
     df['Ticker'] = df['Symbol'].astype(str).str.strip() + '.NS'
     df['Sector'] = df['Industry'].map(derive_sector)
-    return df[['Symbol', 'Ticker', 'Sector', 'Industry']].drop_duplicates('Ticker')
+    df['Classification Source'] = 'Nifty Indices'
+    return df[['Symbol', 'Ticker', 'Sector', 'Industry', 'Classification Source']].drop_duplicates('Ticker')
 
 
+EXTENDED_CLASSIFICATION_URLS = [
+    'https://www.niftyindices.com/IndexConstituent/ind_niftytotalmarket_list.csv',
+    'https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv',
+    'https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv',
+    'https://www.niftyindices.com/IndexConstituent/ind_niftymicrocap250_list.csv',
+]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load_extended_classification():
+    """Best-effort official Nifty classification coverage beyond Nifty 500."""
+    frames = []
+    headers = {'User-Agent':'Mozilla/5.0','Accept':'text/csv,text/plain,*/*','Referer':'https://www.niftyindices.com/'}
+    for url in EXTENDED_CLASSIFICATION_URLS:
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            r.raise_for_status()
+            x = pd.read_csv(io.StringIO(r.text))
+            x.columns = [c.strip() for c in x.columns]
+            sym = next((c for c in x.columns if c.lower() == 'symbol'), None)
+            ind = next((c for c in x.columns if c.lower() == 'industry'), None)
+            if sym and ind:
+                z = x[[sym,ind]].rename(columns={sym:'Symbol',ind:'Industry'}).copy()
+                z['Symbol'] = z['Symbol'].astype(str).str.strip()
+                z['Sector'] = z['Industry'].map(derive_sector)
+                z['Classification Source'] = 'Nifty Indices'
+                frames.append(z)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(columns=['Symbol','Sector','Industry','Classification Source'])
+    return pd.concat(frames, ignore_index=True).drop_duplicates('Symbol')
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -153,11 +318,11 @@ def load_broad_nse_universe():
     eq['Symbol'] = eq[symbol_col].astype(str).str.strip()
     eq = eq[eq['Symbol'].ne('')].drop_duplicates('Symbol')
     eq['Ticker'] = eq['Symbol'] + '.NS'
-    n500 = load_constituents()[['Symbol','Sector','Industry']].drop_duplicates('Symbol')
-    eq = eq.merge(n500, on='Symbol', how='left')
-    # Industry is intentionally left missing outside Nifty 500 so broad stock discovery
-    # does not pollute sector rankings with one giant "Other" bucket.
-    return eq[['Symbol','Ticker','Sector','Industry']].reset_index(drop=True)
+    n500 = load_constituents()[['Symbol','Sector','Industry','Classification Source']].drop_duplicates('Symbol')
+    ext = load_extended_classification()
+    mapping = pd.concat([n500, ext], ignore_index=True).drop_duplicates('Symbol')
+    eq = eq.merge(mapping, on='Symbol', how='left')
+    return eq[['Symbol','Ticker','Sector','Industry','Classification Source']].reset_index(drop=True)
 
 
 @st.cache_data(ttl=20 * 60, show_spinner=False)
@@ -511,7 +676,8 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     out['Volume Persistence 10D'] = tail10.groupby('SYMBOL')['vol_above'].sum()
 
     out = out[out['20D Avg Traded Value Cr'].fillna(0) >= float(min_traded_value_cr)]
-    out = out.reset_index().rename(columns={'SYMBOL':'Symbol'}).merge(meta[['Symbol','Sector','Industry']], on='Symbol', how='left')
+    merge_cols = [c for c in ['Symbol','Sector','Industry','Classification Source'] if c in meta.columns]
+    out = out.reset_index().rename(columns={'SYMBOL':'Symbol'}).merge(meta[merge_cols], on='Symbol', how='left')
 
     # Sector-relative strength where an industry mapping exists; unmapped broad-NSE names stay N/A.
     sector_ret = out.dropna(subset=['Industry']).groupby('Industry')['1M Price Change %'].median()
@@ -628,6 +794,9 @@ def summarize_sector_delivery(delivery_long: pd.DataFrame):
     latest = sector_pivot.iloc[-1].rename('Latest Delivery %').to_frame()
     latest['5D Avg Delivery %'] = sector_smooth.iloc[-1].reindex(latest.index)
     latest['5D Trend'] = latest['Latest Delivery %'] - latest['5D Avg Delivery %']
+    roll20_mean = sector_pivot.rolling(20).mean()
+    roll20_std = sector_pivot.rolling(20).std().replace(0, np.nan)
+    latest['Delivery Z Score'] = ((sector_smooth.iloc[-1] - roll20_mean.iloc[-1]) / roll20_std.iloc[-1]).reindex(latest.index)
     if len(sector_pivot) >= 6:
         latest['5D Change'] = (sector_pivot.iloc[-1] - sector_pivot.iloc[-6]).reindex(latest.index)
     else:
@@ -787,15 +956,17 @@ def merge_sector_scores(sector_rank: pd.DataFrame, sector_market_summary: pd.Dat
     if sector_rank.empty and sector_market_summary.empty:
         return pd.DataFrame()
     out = sector_rank.join(sector_market_summary, how='outer')
-    for col in ['Latest Delivery %', '5D Avg Delivery %', '5D Trend', '5D Change', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', 'Sector 5D Volume x']:
+    for col in ['Latest Delivery %', '5D Avg Delivery %', 'Delivery Z Score', '5D Trend', '5D Change', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', 'Sector 5D Volume x']:
         if col not in out.columns:
             out[col] = np.nan
     dp = percentile_series(out['5D Avg Delivery %'])
+    dzp = percentile_series(out['Delivery Z Score'])
     vp = percentile_series(out['Sector Volume Spike x'])
     rp = percentile_series(out['Sector RS 20D %'])
     r5p = percentile_series(out['Sector RS 5D %'])
-    out['Sector Opportunity Score'] = (0.35*dp + 0.25*vp + 0.25*rp + 0.15*r5p).round(1)
-    return out.sort_values(['Sector Opportunity Score', '5D Avg Delivery %'], ascending=False)
+    # Delivery is useful only when participation/relative strength also confirm.
+    out['Sector Opportunity Score'] = (0.22*dp + 0.13*dzp + 0.25*vp + 0.25*rp + 0.15*r5p).round(1)
+    return out.sort_values(['Sector Opportunity Score', 'Sector Volume Spike x', '5D Avg Delivery %'], ascending=False)
 
 
 def line_chart_with_scale(df: pd.DataFrame, title: str, log_scale: bool = False, height: int = 430):
@@ -813,6 +984,120 @@ def line_chart_with_scale(df: pd.DataFrame, title: str, log_scale: bool = False,
     st.altair_chart(chart, use_container_width=True)
 
 
+
+
+def render_frozen_grid(df: pd.DataFrame, pinned_left=None, height=420, score_columns=None, link_columns=None, key=None):
+    """Professional scrollable grid with important columns pinned on the left."""
+    if df is None or df.empty:
+        st.info('No data available for this view.')
+        return
+    pinned_left = pinned_left or []
+    score_columns = score_columns or []
+    link_columns = link_columns or []
+    view = df.copy()
+    gb = GridOptionsBuilder.from_dataframe(view)
+    gb.configure_default_column(resizable=True, sortable=True, filter=True, minWidth=105, flex=0)
+    for col in pinned_left:
+        if col in view.columns:
+            gb.configure_column(col, pinned='left', lockPinned=True, minWidth=125)
+
+    score_style = JsCode("""
+        function(params) {
+          if (params.value === null || params.value === undefined || isNaN(params.value)) return {};
+          let v = Math.max(0, Math.min(100, Number(params.value)));
+          let a = 0.10 + 0.65 * (v / 100.0);
+          return {backgroundColor: 'rgba(34,197,94,' + a + ')', fontWeight:'700'};
+        }
+    """)
+    for col in score_columns:
+        if col in view.columns:
+            gb.configure_column(col, cellStyle=score_style, minWidth=145)
+
+    link_renderer = JsCode("""
+        class UrlCellRenderer {
+          init(params) {
+            this.eGui = document.createElement('a');
+            this.eGui.innerText = 'Open chart';
+            this.eGui.setAttribute('href', params.value || '#');
+            this.eGui.setAttribute('target', '_blank');
+            this.eGui.style.color = '#60a5fa';
+            this.eGui.style.fontWeight = '600';
+          }
+          getGui() { return this.eGui; }
+        }
+    """)
+    for col in link_columns:
+        if col in view.columns:
+            gb.configure_column(col, cellRenderer=link_renderer, minWidth=110)
+
+    # Compact numeric formatting while retaining true numeric sorting/filtering.
+    one_dec = JsCode("function(p){return (p.value===null||p.value===undefined||isNaN(p.value))?'':Number(p.value).toFixed(1);}")
+    two_dec = JsCode("function(p){return (p.value===null||p.value===undefined||isNaN(p.value))?'':Number(p.value).toFixed(2);}")
+    int_fmt = JsCode("function(p){return (p.value===null||p.value===undefined||isNaN(p.value))?'':Math.round(Number(p.value));}")
+    for col in view.columns:
+        if col in link_columns:
+            continue
+        if pd.api.types.is_numeric_dtype(view[col]):
+            if 'Score' in col or 'Delivery %' in col or 'Traded Value' in col:
+                gb.configure_column(col, valueFormatter=one_dec)
+            elif 'Persistence' in col or 'Coverage' in col:
+                gb.configure_column(col, valueFormatter=int_fmt)
+            else:
+                gb.configure_column(col, valueFormatter=two_dec)
+
+    gb.configure_grid_options(rowHeight=36, headerHeight=40, suppressRowClickSelection=True, ensureDomOrder=True)
+    AgGrid(
+        view,
+        gridOptions=gb.build(),
+        height=height,
+        use_container_width=True,
+        theme='streamlit',
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=False,
+        key=key,
+    )
+
+
+def render_sector_radar_cards(sector_df: pd.DataFrame, limit=8):
+    """Always-visible green opportunity cards; darker green means stronger score."""
+    if sector_df is None or sector_df.empty:
+        st.info('Sector Radar is waiting for sector data. It will remain visible here once the scan is ready.')
+        return
+    x = sector_df.head(limit).copy().reset_index()
+    first = x.columns[0]
+    x = x.rename(columns={first:'Sector'})
+    cards = []
+    for _, r in x.iterrows():
+        score = float(r.get('Sector Opportunity Score', 0) or 0)
+        score = max(0, min(100, score))
+        alpha = 0.12 + 0.70*(score/100.0)
+        border = 0.30 + 0.65*(score/100.0)
+        delivery = r.get('5D Avg Delivery %', np.nan)
+        vol = r.get('Sector Volume Spike x', np.nan)
+        rs = r.get('Sector RS 20D %', np.nan)
+        dz = r.get('Delivery Z Score', np.nan)
+        details = []
+        if pd.notna(delivery): details.append(f'Delivery {delivery:.1f}%')
+        if pd.notna(vol): details.append(f'RVOL {vol:.2f}x')
+        if pd.notna(rs): details.append(f'RS {rs:+.1f}%')
+        if pd.notna(dz): details.append(f'D-Z {dz:+.1f}')
+        cards.append(f"""
+        <div class='sector-radar-card' style='background:rgba(22,163,74,{alpha:.2f});border:1px solid rgba(34,197,94,{border:.2f});'>
+          <div class='sector-radar-name'>{r['Sector']}</div>
+          <div class='sector-radar-score'>{score:.0f}</div>
+          <div class='sector-radar-detail'>{' · '.join(details)}</div>
+        </div>
+        """)
+    st.markdown("<div class='sector-radar-grid'>" + ''.join(cards) + "</div>", unsafe_allow_html=True)
+    st.caption('Darker green = higher combined opportunity score. Score blends delivery abnormality, volume expansion and relative strength.')
+
+
+def classification_coverage(df: pd.DataFrame):
+    if df is None or df.empty:
+        return 0, 0, 0.0
+    mapped = int((df['Industry'].notna() & df['Sector'].notna()).sum()) if {'Industry','Sector'}.issubset(df.columns) else 0
+    total = len(df)
+    return mapped, total, (mapped/total*100 if total else 0)
 
 
 def _statement_value(df, names, col_idx=0):
@@ -920,7 +1205,7 @@ def enrich_piotroski(symbols, workers=6):
     return pd.DataFrame(rows)
 
 
-def add_entry_scores(df: pd.DataFrame):
+def add_entry_scores(df: pd.DataFrame, piotroski_floor=8):
     """Entry score uses cheap technical/participation features; Piotroski is optional enrichment."""
     if df.empty:
         return df
@@ -988,7 +1273,7 @@ def add_entry_scores(df: pd.DataFrame):
             r.get('Extension Penalty', 99) <= 5 and
             r.get('Volume Spike x', 0) >= 1.0
         )
-        fundamental_ok = (not np.isfinite(fs)) or fs >= 8
+        fundamental_ok = (not np.isfinite(fs)) or fs >= float(piotroski_floor)
         if score >= 80 and supportive and fundamental_ok and ('EXTENDED' not in opp) and ('DISTRIBUTION' not in opp):
             return '⭐ BEST ENTRY SETUP'
         if score >= 70 and supportive and ('EXTENDED' not in opp):
@@ -1028,6 +1313,11 @@ st.markdown("""
     .status-title {font-size: 1.7rem; font-weight: 800; margin-bottom: 0.25rem;}
     .status-sub {font-size: 1rem; opacity: 0.95;}
     .small-note {color:#6b7280; font-size:0.9rem;}
+    .sector-radar-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:8px 0 12px 0;}
+    .sector-radar-card {border-radius:13px;padding:13px 14px;min-height:104px;box-shadow:0 6px 18px rgba(0,0,0,.12);}
+    .sector-radar-name {font-size:.92rem;font-weight:700;line-height:1.2;margin-bottom:7px;}
+    .sector-radar-score {font-size:1.65rem;font-weight:800;line-height:1;margin-bottom:8px;}
+    .sector-radar-detail {font-size:.76rem;opacity:.92;line-height:1.35;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1046,8 +1336,13 @@ with st.sidebar:
                                   help='Used for sector and stock delivery tracking.')
     top_sector_count = st.slider('Default sectors on chart', 3, 10, 5, 1,
                                  help='Fewer sectors make the delivery chart cleaner.')
+    with st.expander('Classification quality', expanded=False):
+        auto_enrich_profiles = st.checkbox('Auto-fill missing sector / industry', value=True,
+                                           help='Uses structured Yahoo data first and Moneycontrol as a fallback only for the most relevant unmapped stocks.')
+        classification_depth = st.select_slider('Auto-enrich top unmapped candidates', options=[25, 50, 75, 100, 150], value=50,
+                                                help='Higher values improve classification coverage but may add some first-run lookup time. Results are cached for 7 days.')
     refresh = st.button('Refresh all data', use_container_width=True)
-    st.caption('Fast broad mode uses NSE bhavcopy for ~2,000 stocks and loads detailed sector data separately.')
+    st.caption('Fast broad mode uses NSE bhavcopy for ~2,000 stocks. Classification enrichment is cached and limited to relevant names.')
 
 if refresh:
     st.cache_data.clear()
@@ -1088,6 +1383,17 @@ try:
             delivery_long = mapped_delivery[['Date','SYMBOL','Industry','DELIV_PER']].rename(columns={'SYMBOL':'Symbol','DELIV_PER':'Delivery %'})
         else:
             delivery_long = pd.DataFrame()
+
+    # Auto-fill missing classifications only for the most relevant broad-market names.
+    if auto_enrich_profiles and not stock_rank.empty:
+        missing_mask = stock_rank['Industry'].isna() | stock_rank['Sector'].isna()
+        missing_candidates = stock_rank[missing_mask].sort_values(
+            ['Entry Suitability Score','Accumulation Score','Participation Conviction'], ascending=False
+        ).head(int(classification_depth))
+        if not missing_candidates.empty:
+            progress.progress(62, text=f'Filling sector / industry for {len(missing_candidates)} relevant unmapped stocks…')
+            prof = enrich_profiles(missing_candidates['Symbol'].tolist())
+            stock_rank = apply_profile_enrichment(stock_rank, prof)
 
     progress.progress(75, text='Building sector delivery and relative-strength views…')
     sector_pivot, sector_smooth, sector_rank = summarize_sector_delivery(delivery_long)
@@ -1140,9 +1446,8 @@ try:
         k5.metric('Actionable Candidates', f'{accumulation_stocks}', 'Score ≥ 70')
 
         st.markdown('#### Opportunity Funnel')
-        mapped_count = int(stock_rank['Industry'].notna().sum()) if (not stock_rank.empty and 'Industry' in stock_rank.columns) else 0
-        mapped_pct = (mapped_count / len(stock_rank) * 100) if len(stock_rank) else 0
-        st.caption(f"Scanning {len(meta):,} NSE EQ-series stocks. {mapped_count:,} ranked stocks ({mapped_pct:.0f}%) already have industry mapping; missing labels for final candidates are resolved only at the quality gate to preserve speed.")
+        mapped_count, mapped_total, mapped_pct = classification_coverage(stock_rank)
+        st.caption(f"Scanning {len(meta):,} NSE EQ-series stocks. {mapped_count:,}/{mapped_total:,} ranked stocks ({mapped_pct:.0f}%) currently have both sector and industry labels. Official Nifty classification is used first; relevant missing labels are enriched from Yahoo and Moneycontrol fallback and cached.")
         f1, f2, f3, f4, f5 = st.columns(5)
         f1.metric('Universe', f'{len(stock_rank):,}' if not stock_rank.empty else '0')
         f2.metric('RS Positive', f'{positive_rs_stocks:,}')
@@ -1150,34 +1455,20 @@ try:
         f4.metric('Volume Expanding', f'{volume_stocks:,}')
         f5.metric('High Accumulation', f'{accumulation_stocks:,}')
 
-        # SECTOR SNAPSHOT
+        # SECTOR SNAPSHOT — always visible on the front page.
         st.markdown('#### Sector Radar')
-        left, right = st.columns([1.1, 1])
-        with left:
-            if not top_sector_df.empty:
-                sector_bar = top_sector_df[['Sector Opportunity Score']].copy().reset_index().rename(columns={'index':'Sector'})
-                sector_bar = sector_bar.sort_values('Sector Opportunity Score', ascending=True)
-                bar = alt.Chart(sector_bar).mark_bar(cornerRadiusEnd=5).encode(
-                    x=alt.X('Sector Opportunity Score:Q', scale=alt.Scale(domain=[0, 100]), title='Opportunity Score'),
-                    y=alt.Y('Sector:N', sort=None, title=None),
-                    tooltip=[alt.Tooltip('Sector:N'), alt.Tooltip('Sector Opportunity Score:Q', format='.0f')]
-                ).properties(height=330)
-                st.altair_chart(bar, use_container_width=True)
-            else:
-                st.info('Sector opportunity data is not available yet.')
-
-        with right:
-            if not top_sector_df.empty:
-                radar = top_sector_df.reset_index().rename(columns={'index': 'Sector'}).head(6)
-                radar_cols = ['Sector', 'Sector Opportunity Score', '5D Avg Delivery %', 'Sector Volume Spike x', 'Sector RS 20D %', 'Sector RS 5D %']
-                radar_cols = [c for c in radar_cols if c in radar.columns]
-                st.dataframe(radar[radar_cols].style.format({
-                    'Sector Opportunity Score': '{:.0f}',
-                    '5D Avg Delivery %': '{:.1f}',
-                    'Sector Volume Spike x': '{:.2f}x',
-                    'Sector RS 20D %': '{:+.2f}',
-                    'Sector RS 5D %': '{:+.2f}',
-                }), use_container_width=True, hide_index=True, height=330)
+        render_sector_radar_cards(top_sector_df, limit=8)
+        if not top_sector_df.empty:
+            radar = top_sector_df.reset_index().rename(columns={'index': 'Industry'}).head(8)
+            radar_cols = ['Industry', 'Sector Opportunity Score', '5D Avg Delivery %', 'Delivery Z Score', 'Sector Volume Spike x', 'Sector RS 20D %', 'Sector RS 5D %']
+            radar_cols = [c for c in radar_cols if c in radar.columns]
+            render_frozen_grid(
+                radar[radar_cols],
+                pinned_left=['Industry','Sector Opportunity Score'],
+                score_columns=['Sector Opportunity Score'],
+                height=335,
+                key='overview_sector_radar_grid',
+            )
 
         # ROTATION SNAPSHOT
         st.markdown('#### Sector Rotation Snapshot')
@@ -1209,20 +1500,18 @@ try:
         # STOCK RADAR
         st.markdown('#### Stock Opportunity Radar')
         if not top_stock_df.empty:
-            stock_show = top_stock_df.copy().head(10)
+            stock_show = top_stock_df.copy().head(12)
             stock_show['TradingView'] = stock_show['Symbol'].map(tradingview_url)
-            radar_cols = ['Symbol','Sector','Industry','Signal','Accumulation Score','Participation Conviction','Today % Change','Today Traded Value Cr','Latest Delivery %','Volume Spike x','RS vs N500 20D %','RS vs N500 5D %','TradingView']
+            radar_cols = ['Symbol','Signal','Entry Suitability Score','Accumulation Score','Sector','Industry','Classification Source','Participation Conviction','Today % Change','Today Traded Value Cr','Latest Delivery %','Delivery Z','Volume Spike x','Volume Z','RS vs N500 20D %','RS vs N500 5D %','TradingView']
             radar_cols = [c for c in radar_cols if c in stock_show.columns]
-            st.dataframe(stock_show[radar_cols].style.format({
-                'Accumulation Score': '{:.0f}',
-                'Participation Conviction': '{:.0f}',
-                'Today % Change': '{:+.2f}',
-                'Today Traded Value Cr': '{:.1f}',
-                'Latest Delivery %': '{:.1f}',
-                'Volume Spike x': '{:.2f}x',
-                'RS vs N500 20D %': '{:+.2f}',
-                'RS vs N500 5D %': '{:+.2f}',
-            }), use_container_width=True, hide_index=True, column_config={'TradingView': st.column_config.LinkColumn('TradingView', display_text='Open chart')})
+            render_frozen_grid(
+                stock_show[radar_cols],
+                pinned_left=['Symbol','Signal','Entry Suitability Score','Accumulation Score'],
+                score_columns=['Entry Suitability Score','Accumulation Score','Participation Conviction'],
+                link_columns=['TradingView'],
+                height=440,
+                key='overview_stock_radar_grid',
+            )
         else:
             st.info('Stock opportunity data is not available yet.')
 
@@ -1295,7 +1584,7 @@ try:
             ).properties(height=max(420, 25*len(chart_df)))
             st.altair_chart(chart, use_container_width=True)
             show = industry_perf.rename(columns={'Today_Median':'Today Median %','Advancers':'Advancers %','Traded_Value_Cr':'Today Traded Value ₹Cr','Avg_Delivery':'Avg Delivery %','Avg_Volume_Spike':'Avg Volume Spike x'})
-            st.dataframe(show.style.format({'Today Median %':'{:+.2f}','Advancers %':'{:.0f}','Today Traded Value ₹Cr':'{:.1f}','Avg Delivery %':'{:.1f}','Avg Volume Spike x':'{:.2f}x'}), use_container_width=True, hide_index=True)
+            render_frozen_grid(show, pinned_left=['Industry'], height=460, key='industry_gain_loss_grid')
 
     with tabs[3]:
         st.subheader('Sector delivery + volume activity')
@@ -1325,22 +1614,17 @@ try:
 
             st.markdown('**Sector opportunity ranking — delivery + volume + relative strength**')
             rank_show = sector_opportunity.reset_index().rename(columns={'index': 'Industry'})
-            show_cols = ['Industry', 'Sector Opportunity Score', 'Latest Delivery %', '5D Avg Delivery %', 'Sector Volume Spike x', 'Sector 5D Volume x', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', '5D Change']
+            show_cols = ['Industry', 'Sector Opportunity Score', 'Delivery Z Score', 'Latest Delivery %', '5D Avg Delivery %', 'Sector Volume Spike x', 'Sector 5D Volume x', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', '5D Change']
             show_cols = [c for c in show_cols if c in rank_show.columns]
-            st.dataframe(rank_show[show_cols].style.format({
-                'Sector Opportunity Score': '{:.1f}',
-                'Latest Delivery %': '{:.1f}',
-                '5D Avg Delivery %': '{:.1f}',
-                'Sector Volume Spike x': '{:.2f}x',
-                'Sector 5D Volume x': '{:.2f}x',
-                'Sector 20D Price %': '{:+.2f}',
-                'Sector 5D Price %': '{:+.2f}',
-                'Sector RS 20D %': '{:+.2f}',
-                'Sector RS 5D %': '{:+.2f}',
-                '5D Change': '{:+.1f}',
-            }), use_container_width=True, hide_index=True)
+            render_frozen_grid(
+                rank_show[show_cols],
+                pinned_left=['Industry','Sector Opportunity Score'],
+                score_columns=['Sector Opportunity Score'],
+                height=470,
+                key='sector_delivery_volume_grid',
+            )
 
-            st.caption('Interpretation: a sector can rank highly even with a modest price move if delivery is persistently high, turnover/volume is expanding, and RS versus NIFTY 500 is improving.')
+            st.caption('Pinned columns stay visible while you scroll horizontally. Delivery Z above 0 means sector delivery is above its own recent normal; volume and RS must confirm before the opportunity score becomes strong.')
 
     with tabs[4]:
         st.subheader('Sector relative strength vs NIFTY 500')
@@ -1382,25 +1666,23 @@ try:
         if stock_rank.empty:
             st.warning('Stock delivery data could not be loaded right now.')
         else:
-            sector_options = sector_opportunity.index.tolist() if not sector_opportunity.empty else sorted(stock_rank['Industry'].dropna().unique().tolist())
-            chosen_sector = st.selectbox('Choose sector', options=sector_options, key='sector_drilldown')
+            ranked_sectors = sector_opportunity.index.tolist() if not sector_opportunity.empty else []
+            all_mapped = sorted(stock_rank['Industry'].dropna().astype(str).unique().tolist())
+            sector_options = ranked_sectors + [x for x in all_mapped if x not in ranked_sectors]
+            chosen_sector = st.selectbox('Choose sector / industry', options=sector_options, key='sector_drilldown')
             sector_stocks = stock_rank[stock_rank['Industry'] == chosen_sector].copy()
             sector_stocks = sector_stocks.sort_values(['Accumulation Score', 'Volume Spike x'], ascending=False)
             sector_stocks['TradingView'] = sector_stocks['Symbol'].map(tradingview_url)
-            show_cols = ['Symbol', 'Signal', 'Accumulation Score', 'Today % Change', 'Today Traded Value Cr', 'Latest Delivery %', '20D Avg Delivery %', 'Volume Spike x', '5D Volume x', 'RS vs N500 20D %', 'RS vs N500 5D %', '1M Price Change %', '5D Price Change %', 'TradingView']
-            st.dataframe(sector_stocks[show_cols].style.format({
-                'Accumulation Score': '{:.1f}',
-                'Today % Change': '{:+.2f}',
-                'Today Traded Value Cr': '{:.1f}',
-                'Latest Delivery %': '{:.1f}',
-                '20D Avg Delivery %': '{:.1f}',
-                'Volume Spike x': '{:.2f}x',
-                '5D Volume x': '{:.2f}x',
-                'RS vs N500 20D %': '{:+.2f}',
-                'RS vs N500 5D %': '{:+.2f}',
-                '1M Price Change %': '{:+.2f}',
-                '5D Price Change %': '{:+.2f}',
-            }), use_container_width=True, hide_index=True, column_config={'TradingView': st.column_config.LinkColumn('TradingView', display_text='Open chart')})
+            show_cols = ['Symbol', 'Signal', 'Accumulation Score', 'Entry Suitability Score', 'Sector', 'Industry', 'Today % Change', 'Today Traded Value Cr', 'Latest Delivery %', 'Delivery Z', '20D Avg Delivery %', 'Volume Spike x', 'Volume Z', '5D Volume x', 'RS vs N500 20D %', 'RS vs N500 5D %', '1M Price Change %', '5D Price Change %', 'TradingView']
+            show_cols = [c for c in show_cols if c in sector_stocks.columns]
+            render_frozen_grid(
+                sector_stocks[show_cols],
+                pinned_left=['Symbol','Signal','Accumulation Score'],
+                score_columns=['Accumulation Score','Entry Suitability Score'],
+                link_columns=['TradingView'],
+                height=500,
+                key='sector_stock_grid',
+            )
 
             if not sector_stocks.empty:
                 stock_choice = st.selectbox('View stock RS chart', options=sector_stocks['Symbol'].head(50).tolist(), key='stock_rs_choice')
@@ -1453,18 +1735,19 @@ try:
             filtered = add_entry_scores(filtered)
 
             st.markdown('#### Technical pre-screen')
-            st.caption('These are not final actionable stocks yet. Final names appear only after the Piotroski 8–9 quality gate below.')
+            st.caption('These are technical/participation candidates. You decide how strict the Piotroski fundamental gate should be below.')
             st.metric('Technical candidates awaiting fundamental gate', f'{len(filtered):,}')
 
             type_counts = filtered['Opportunity Type'].value_counts().rename_axis('Opportunity Type').reset_index(name='Stocks')
             st.markdown('#### Opportunity mix')
             st.dataframe(type_counts, use_container_width=True, hide_index=True)
 
-            st.markdown('#### Final quality gate — Piotroski 8 or 9 only')
-            st.caption('To preserve speed, fundamentals and missing sector/industry labels are fetched only for the final technical shortlist. The actionable table below keeps only F-Score 8–9 stocks.')
-            cpi1, cpi2 = st.columns([2,1])
-            pi_count = cpi1.slider('Candidates to run through final quality gate', 5, 30, 15, 5)
-            load_pi = cpi2.button('Run final quality gate', use_container_width=True)
+            st.markdown('#### Final quality gate — choose your Piotroski threshold')
+            st.caption('Fundamentals are fetched only for the final shortlist, so broad-NSE speed is preserved. Higher F-Score = stricter quality filter; lower it when you want a wider opportunity set.')
+            cpi1, cpi2, cpi3 = st.columns([1.2, 1.4, 1])
+            pi_min_score = cpi1.slider('Minimum Piotroski F-Score', 0, 9, 8, 1, key='pi_min_score')
+            pi_count = cpi2.slider('Candidates to run through final quality gate', 5, 40, 15, 5)
+            load_pi = cpi3.button('Run final quality gate', use_container_width=True)
             if 'final_quality_data' not in st.session_state:
                 st.session_state['final_quality_data'] = pd.DataFrame()
             if load_pi and not filtered.empty:
@@ -1477,53 +1760,54 @@ try:
 
             quality = st.session_state.get('final_quality_data', pd.DataFrame())
             if isinstance(quality, pd.DataFrame) and not quality.empty:
-                filtered = filtered.drop(columns=['Piotroski F-Score','F-Score Coverage'], errors='ignore').merge(quality, on='Symbol', how='inner')
-                # Fill missing broad-universe classification only at the final, actionable stage.
-                filtered['Industry'] = filtered['Industry'].where(filtered['Industry'].notna(), filtered.get('Resolved Industry'))
-                filtered['Sector'] = filtered['Sector'].where(filtered['Sector'].notna(), filtered.get('Resolved Sector'))
-                filtered = filtered[filtered['Piotroski F-Score'] > 7].copy()
-                filtered = add_entry_scores(filtered)
+                pio_cols = [c for c in ['Symbol','Piotroski F-Score','F-Score Coverage'] if c in quality.columns]
+                prof_cols = [c for c in ['Symbol','Resolved Industry','Resolved Sector','Resolved Source'] if c in quality.columns]
+                filtered = filtered.drop(columns=['Piotroski F-Score','F-Score Coverage'], errors='ignore').merge(quality[pio_cols], on='Symbol', how='inner')
+                if len(prof_cols) > 1:
+                    filtered = apply_profile_enrichment(filtered, quality[prof_cols])
+                filtered = filtered[filtered['Piotroski F-Score'].notna() & (filtered['Piotroski F-Score'] >= float(pi_min_score))].copy()
+                filtered = add_entry_scores(filtered, piotroski_floor=pi_min_score)
                 filtered['TradingView'] = filtered['Symbol'].map(tradingview_url)
             else:
                 filtered = pd.DataFrame()
-                st.info('Run the final quality gate to see actionable stocks. Only Piotroski 8–9 candidates will be retained.')
+                st.info(f'Run the final quality gate to see stocks meeting your selected Piotroski threshold (currently ≥ {pi_min_score}).')
 
             if not filtered.empty:
-                st.success(f"{len(filtered)} candidate(s) passed Piotroski ≥ 8 and the technical/participation filters.")
-                top_n = st.slider('Rows to display', 5, 50, min(20, max(5,len(filtered))), 5, key='accum_rows')
+                st.success(f"{len(filtered)} candidate(s) passed Piotroski ≥ {pi_min_score} and the technical/participation filters.")
+                top_n = st.slider('Rows to display', 5, 50, 20, 5, key='accum_rows')
                 preferred = [
-                    'Entry View','Opportunity Type','Symbol','Sector','Industry','Entry Suitability Score','Piotroski F-Score','F-Score Coverage',
-                    'Accumulation Score','Participation Conviction','Today % Change','Today Traded Value Cr','Latest Delivery %','20D Avg Delivery %','Delivery Z','Delivery Acceleration',
+                    'Entry View','Opportunity Type','Symbol','Entry Suitability Score','Piotroski F-Score','Accumulation Score',
+                    'Sector','Industry','Classification Source','Participation Conviction','Today % Change','Today Traded Value Cr',
+                    'Latest Delivery %','20D Avg Delivery %','Delivery Z','Delivery Acceleration',
                     'Volume Spike x','Volume Z','5D Volume x','Delivery Persistence 10D','Volume Persistence 10D',
                     'RS vs N500 20D %','RS vs N500 5D %','RS Acceleration','RS vs Sector 20D %',
                     'Distance to 20D High %','Price Extension vs 20DMA %','Volatility Contraction',
-                    '1M Price Change %','5D Price Change %','Extension Penalty','TradingView'
+                    '1M Price Change %','5D Price Change %','Extension Penalty','F-Score Coverage','TradingView'
                 ]
                 show_cols = [c for c in preferred if c in filtered.columns]
                 display_df = filtered[show_cols].head(top_n).copy()
-                fmt = {
-                    'Entry Suitability Score':'{:.1f}','Accumulation Score':'{:.1f}','Participation Conviction':'{:.1f}',
-                    'Today % Change':'{:+.2f}','Today Traded Value Cr':'{:.1f}',
-                    'Latest Delivery %':'{:.1f}','20D Avg Delivery %':'{:.1f}','Delivery Z':'{:+.2f}',
-                    'Delivery Acceleration':'{:+.1f}','Volume Spike x':'{:.2f}x','Volume Z':'{:+.2f}','5D Volume x':'{:.2f}x',
-                    'RS vs N500 20D %':'{:+.2f}','RS vs N500 5D %':'{:+.2f}','RS Acceleration':'{:+.2f}',
-                    'RS vs Sector 20D %':'{:+.2f}','Distance to 20D High %':'{:+.2f}','Price Extension vs 20DMA %':'{:+.2f}',
-                    'Volatility Contraction':'{:.2f}x','1M Price Change %':'{:+.2f}','5D Price Change %':'{:+.2f}','Extension Penalty':'{:.0f}'
-                }
-                fmt['Piotroski F-Score'] = lambda x: 'N/A' if pd.isna(x) else f'{x:.0f}/9'
-                st.dataframe(display_df.style.format({k:v for k,v in fmt.items() if k in display_df.columns}), use_container_width=True, hide_index=True,
-                             column_config={'TradingView': st.column_config.LinkColumn('TradingView', display_text='Open chart')})
+                render_frozen_grid(
+                    display_df,
+                    pinned_left=['Entry View','Opportunity Type','Symbol','Entry Suitability Score','Piotroski F-Score','Accumulation Score'],
+                    score_columns=['Entry Suitability Score','Accumulation Score'],
+                    link_columns=['TradingView'],
+                    height=560,
+                    key='accumulation_quality_grid',
+                )
                 chart_pick = st.selectbox('TradingView / detailed chart stock', options=filtered['Symbol'].head(30).tolist(), key='accum_chart_pick')
                 st.link_button('Open selected stock in TradingView', tradingview_url(chart_pick))
 
+                best = filtered[filtered['Entry View'] == '⭐ BEST ENTRY SETUP'].head(5)
                 early = filtered[filtered['Opportunity Type'] == '🟣 EARLY ACCUMULATION'].head(10)
                 setup = filtered[filtered['Opportunity Type'] == '🔵 SETUP READY'].head(10)
+                if not best.empty:
+                    st.success('Best entry setups: ' + ', '.join(best['Symbol'].tolist()))
                 if not early.empty:
-                    st.success('Early accumulation: ' + ', '.join(early['Symbol'].tolist()))
+                    st.info('Early accumulation: ' + ', '.join(early['Symbol'].tolist()))
                 if not setup.empty:
                     st.info('Setup ready: ' + ', '.join(setup['Symbol'].tolist()))
 
-            st.caption('Key interpretation: positive Delivery/Volume Z means activity is unusually high for that stock; RS Acceleration identifies improving leadership; values below 1.0 in Volatility Contraction indicate short-term volatility is contracting versus its 20-day norm. Piotroski is confirmation, not the trigger.')
+            st.caption('Key interpretation: positive Delivery/Volume Z means activity is unusually high for that stock; RS Acceleration identifies improving leadership; values below 1.0 in Volatility Contraction indicate short-term volatility is contracting versus its 20-day norm. Piotroski is a selectable quality gate, not the trigger.')
 
 
 

@@ -4,3 +4,5 @@ numpy>=1.26
 yfinance>=0.2.54
 requests>=2.31
 altair>=5.0
+beautifulsoup4>=4.12
+streamlit-aggrid>=1.0.5

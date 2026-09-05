@@ -1,32 +1,40 @@
-MARKET INTELLIGENCE TERMINAL v8 — QUALITY + LIQUIDITY + INDUSTRY UPGRADE
+MARKET INTELLIGENCE TERMINAL v9 — USABILITY + CLASSIFICATION UPGRADE
 
 WHAT IS NEW
-- Current-session % change is shown alongside 5D and 1M change.
-- Delivery is no longer treated as strong by itself: volume abnormality, traded value and persistence now materially affect Accumulation Score.
-- New Participation Conviction score combines Delivery Z, Volume Z, traded value and persistence.
-- Final actionable Accumulation list keeps only Piotroski F-Score 8 or 9 stocks.
-- Missing Industry and Sector names for final candidates are resolved on-demand and cached, so the broad ~2,000-stock scan stays fast.
-- New Industry Gain / Loss tab: median current-session move, advancer %, traded value, delivery and volume activity by industry.
-- Sector delivery chart default is now "Excess vs 20D average" instead of raw 40–60% delivery lines; optional Delivery Z-score and raw 5DMA remain available.
-- Sector RS chart is now displayed as relative outperformance/underperformance vs NIFTY 500 in percentage terms over 20/60/130-session windows, making separation easier to read.
-- TradingView chart links are added to sector-stock tables, final accumulation candidates and news drill-down.
-- Data-quality / mapping coverage is shown on the Overview page.
+- Piotroski F-Score is now user-selectable. Choose the minimum score from 0 to 9 before the final quality gate.
+- Important columns are frozen in key tables so they remain visible while scrolling horizontally:
+  * Sector Stocks: Symbol, Signal, Accumulation Score
+  * Sector Delivery + Volume: Industry, Sector Opportunity Score
+  * Stock Opportunity Radar: Symbol, Signal, Entry Suitability, Accumulation Score
+  * Final Accumulation table: Entry View, Opportunity Type, Symbol, Entry Suitability, Piotroski, Accumulation
+- Sector Delivery + Volume ranking now includes Delivery Z Score.
+- Sector Radar is permanently visible on the Overview page and uses a green gradient: darker green means higher opportunity score.
+- Sector/industry mapping coverage is improved with a layered approach:
+  1. Official Nifty Indices classification files where available
+  2. Yahoo Finance structured profile lookup
+  3. Moneycontrol fallback for unresolved high-priority names
+  Lookup results are cached to protect speed.
+- Broader sector/industry options are available in Sector Stocks after enrichment.
+- TradingView links remain available throughout the stock views.
+- High delivery is still not allowed to dominate ranking without volume, traded value and relative-strength confirmation.
 
 HOW TO RUN ON WINDOWS
 1. Extract the ZIP.
 2. Open the folder.
 3. Double-click START_DASHBOARD.bat
-4. The dashboard opens at http://localhost:8501
+4. The launcher installs any missing packages and opens the dashboard at http://localhost:8501
 
 RECOMMENDED WORKFLOW
-1. Overview: market regime + sector radar + broad stock radar.
-2. Industry Gain / Loss: see where the current session is strongest/weakest.
-3. Sector Delivery + Volume: use Delivery Excess or Z-score, not raw delivery alone.
-4. Sector Relative Strength: identify sectors strengthening vs NIFTY 500.
-5. Sector Stocks: drill into stocks and open TradingView charts.
-6. Accumulation Stocks: apply technical filters, then Run Final Quality Gate.
-7. Final actionable table: only Piotroski 8–9 candidates remain; check entry score, current % move, traded value, delivery, volume, RS and TradingView chart.
-8. Stock News: use recent news only as confirmation.
+1. Overview: market state, Opportunity Funnel, always-visible Sector Radar, rotation and Stock Opportunity Radar.
+2. Industry Gain / Loss: see current-session industry strength and participation.
+3. Sector Delivery + Volume: use Delivery Excess or Delivery Z Score plus volume and RS.
+4. Sector Relative Strength: identify groups strengthening vs NIFTY 500.
+5. Sector Stocks: drill into a sector/industry; important columns stay pinned while you scroll.
+6. Accumulation Stocks: set delivery/volume/RS filters, choose your Piotroski threshold, then run the final quality gate.
+7. TradingView + News: validate chart structure and check whether recent developments support the signal.
+
+CLASSIFICATION / SPEED NOTE
+The broad NSE scan is intentionally kept fast. The terminal does not make thousands of slow profile requests at startup. Official index mappings are loaded first; then the most relevant unmapped stocks are auto-enriched using Yahoo Finance and a Moneycontrol fallback. You can change the enrichment depth under Classification quality in the sidebar.
 
 IMPORTANT
-High delivery percentage can be misleading when actual trading activity is small. v8 therefore requires volume/traded-value confirmation and uses delivery relative to the stock's own history. The terminal is a research and shortlisting tool, not an automatic buy instruction.
+This is a research and shortlisting tool, not an automatic buy signal. High delivery percentage alone can be misleading when trading activity is small, so delivery abnormality is combined with volume, traded value, persistence, relative strength and entry-location logic.
