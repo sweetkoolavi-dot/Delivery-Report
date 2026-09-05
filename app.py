@@ -14,7 +14,7 @@ import altair as alt
 from bs4 import BeautifulSoup
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
-st.set_page_config(page_title='Market Intelligence Terminal v9', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Market Intelligence Terminal v9.1', page_icon='📈', layout='wide')
 
 NIFTY500_CSV = 'https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv'
 NSE_EQUITY_LIST_CSV = 'https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv'
@@ -1005,8 +1005,10 @@ def render_frozen_grid(df: pd.DataFrame, pinned_left=None, height=420, score_col
         function(params) {
           if (params.value === null || params.value === undefined || isNaN(params.value)) return {};
           let v = Math.max(0, Math.min(100, Number(params.value)));
-          let a = 0.10 + 0.65 * (v / 100.0);
-          return {backgroundColor: 'rgba(34,197,94,' + a + ')', fontWeight:'700'};
+          if (v >= 82) return {backgroundColor:'#0f766e', color:'#ffffff', fontWeight:'700'};
+          if (v >= 72) return {backgroundColor:'#d1fae5', color:'#065f46', fontWeight:'700'};
+          if (v >= 62) return {backgroundColor:'#fef3c7', color:'#92400e', fontWeight:'650'};
+          return {backgroundColor:'#f3f4f6', color:'#4b5563', fontWeight:'600'};
         }
     """)
     for col in score_columns:
@@ -1059,37 +1061,88 @@ def render_frozen_grid(df: pd.DataFrame, pinned_left=None, height=420, score_col
 
 
 def render_sector_radar_cards(sector_df: pd.DataFrame, limit=8):
-    """Always-visible green opportunity cards; darker green means stronger score."""
+    """Clean, native Sector Radar: ranked bar chart + compact detail strip.
+    Avoids raw HTML so Streamlit never exposes markup as text.
+    """
     if sector_df is None or sector_df.empty:
         st.info('Sector Radar is waiting for sector data. It will remain visible here once the scan is ready.')
         return
+
     x = sector_df.head(limit).copy().reset_index()
     first = x.columns[0]
-    x = x.rename(columns={first:'Sector'})
-    cards = []
-    for _, r in x.iterrows():
-        score = float(r.get('Sector Opportunity Score', 0) or 0)
-        score = max(0, min(100, score))
-        alpha = 0.12 + 0.70*(score/100.0)
-        border = 0.30 + 0.65*(score/100.0)
-        delivery = r.get('5D Avg Delivery %', np.nan)
-        vol = r.get('Sector Volume Spike x', np.nan)
-        rs = r.get('Sector RS 20D %', np.nan)
-        dz = r.get('Delivery Z Score', np.nan)
-        details = []
-        if pd.notna(delivery): details.append(f'Delivery {delivery:.1f}%')
-        if pd.notna(vol): details.append(f'RVOL {vol:.2f}x')
-        if pd.notna(rs): details.append(f'RS {rs:+.1f}%')
-        if pd.notna(dz): details.append(f'D-Z {dz:+.1f}')
-        cards.append(f"""
-        <div class='sector-radar-card' style='background:rgba(22,163,74,{alpha:.2f});border:1px solid rgba(34,197,94,{border:.2f});'>
-          <div class='sector-radar-name'>{r['Sector']}</div>
-          <div class='sector-radar-score'>{score:.0f}</div>
-          <div class='sector-radar-detail'>{' · '.join(details)}</div>
-        </div>
-        """)
-    st.markdown("<div class='sector-radar-grid'>" + ''.join(cards) + "</div>", unsafe_allow_html=True)
-    st.caption('Darker green = higher combined opportunity score. Score blends delivery abnormality, volume expansion and relative strength.')
+    x = x.rename(columns={first: 'Sector'})
+    x['Sector'] = x['Sector'].astype(str)
+    x['Score'] = pd.to_numeric(x.get('Sector Opportunity Score', 0), errors='coerce').fillna(0).clip(0, 100)
+
+    def _band(v):
+        if v >= 80:
+            return 'High conviction'
+        if v >= 68:
+            return 'Positive'
+        if v >= 55:
+            return 'Watch'
+        return 'Neutral'
+
+    x['View'] = x['Score'].map(_band)
+    order = x.sort_values('Score', ascending=False)['Sector'].tolist()
+
+    left, right = st.columns([1.55, 1.0], gap='large')
+    with left:
+        # Restrained palette: only the best group is green; others are blue/amber/neutral.
+        color_scale = alt.Scale(
+            domain=['High conviction', 'Positive', 'Watch', 'Neutral'],
+            range=['#0f766e', '#3b82f6', '#d4a72c', '#94a3b8']
+        )
+        bar = (
+            alt.Chart(x)
+            .mark_bar(cornerRadiusEnd=6, height=22)
+            .encode(
+                y=alt.Y('Sector:N', sort=order, title=None, axis=alt.Axis(labelLimit=180, labelFontSize=12)),
+                x=alt.X('Score:Q', scale=alt.Scale(domain=[0, 100]), title='Opportunity score', axis=alt.Axis(grid=True, tickCount=5)),
+                color=alt.Color('View:N', scale=color_scale, legend=alt.Legend(title=None, orient='bottom')),
+                tooltip=[
+                    alt.Tooltip('Sector:N', title='Sector'),
+                    alt.Tooltip('Score:Q', title='Opportunity', format='.1f'),
+                    alt.Tooltip('View:N', title='View'),
+                    alt.Tooltip('5D Avg Delivery %:Q', title='Delivery 5DMA', format='.1f'),
+                    alt.Tooltip('Delivery Z Score:Q', title='Delivery Z', format='+.2f'),
+                    alt.Tooltip('Sector Volume Spike x:Q', title='RVOL', format='.2f'),
+                    alt.Tooltip('Sector RS 20D %:Q', title='RS 20D', format='+.2f'),
+                ],
+            )
+            .properties(height=max(260, 38 * len(x)))
+        )
+        labels = (
+            alt.Chart(x)
+            .mark_text(align='left', baseline='middle', dx=5, fontWeight='bold', fontSize=12)
+            .encode(
+                y=alt.Y('Sector:N', sort=order),
+                x=alt.X('Score:Q', scale=alt.Scale(domain=[0, 100])),
+                text=alt.Text('Score:Q', format='.0f'),
+                color=alt.value('#334155'),
+            )
+        )
+        st.altair_chart((bar + labels).configure_view(strokeOpacity=0), use_container_width=True)
+        st.caption('Green is reserved for high-conviction sectors. Blue = positive, amber = watch, grey = neutral.')
+
+    with right:
+        st.markdown('**What is driving the leaders**')
+        for _, r in x.sort_values('Score', ascending=False).head(5).iterrows():
+            score = float(r['Score'])
+            delivery = r.get('5D Avg Delivery %', np.nan)
+            vol = r.get('Sector Volume Spike x', np.nan)
+            rs = r.get('Sector RS 20D %', np.nan)
+            dz = r.get('Delivery Z Score', np.nan)
+            with st.container(border=True):
+                a, b = st.columns([2.0, 0.65])
+                a.markdown(f"**{r['Sector']}**  ·  {_band(score)}")
+                b.markdown(f"### {score:.0f}")
+                bits=[]
+                if pd.notna(delivery): bits.append(f"Delivery **{delivery:.1f}%**")
+                if pd.notna(vol): bits.append(f"RVOL **{vol:.2f}×**")
+                if pd.notna(rs): bits.append(f"RS **{rs:+.1f}%**")
+                if pd.notna(dz): bits.append(f"D-Z **{dz:+.1f}**")
+                st.caption(' · '.join(bits))
 
 
 def classification_coverage(df: pd.DataFrame):
@@ -1313,11 +1366,9 @@ st.markdown("""
     .status-title {font-size: 1.7rem; font-weight: 800; margin-bottom: 0.25rem;}
     .status-sub {font-size: 1rem; opacity: 0.95;}
     .small-note {color:#6b7280; font-size:0.9rem;}
-    .sector-radar-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:8px 0 12px 0;}
-    .sector-radar-card {border-radius:13px;padding:13px 14px;min-height:104px;box-shadow:0 6px 18px rgba(0,0,0,.12);}
-    .sector-radar-name {font-size:.92rem;font-weight:700;line-height:1.2;margin-bottom:7px;}
-    .sector-radar-score {font-size:1.65rem;font-weight:800;line-height:1;margin-bottom:8px;}
-    .sector-radar-detail {font-size:.76rem;opacity:.92;line-height:1.35;}
+    div[data-testid="stMetric"] {background:rgba(148,163,184,.055); border:1px solid rgba(148,163,184,.18); padding:10px 12px; border-radius:12px;}
+    div[data-testid="stMetricLabel"] {font-weight:650;}
+    div[data-testid="stVerticalBlockBorderWrapper"] {border-color:rgba(148,163,184,.22) !important; border-radius:12px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1458,17 +1509,7 @@ try:
         # SECTOR SNAPSHOT — always visible on the front page.
         st.markdown('#### Sector Radar')
         render_sector_radar_cards(top_sector_df, limit=8)
-        if not top_sector_df.empty:
-            radar = top_sector_df.reset_index().rename(columns={'index': 'Industry'}).head(8)
-            radar_cols = ['Industry', 'Sector Opportunity Score', '5D Avg Delivery %', 'Delivery Z Score', 'Sector Volume Spike x', 'Sector RS 20D %', 'Sector RS 5D %']
-            radar_cols = [c for c in radar_cols if c in radar.columns]
-            render_frozen_grid(
-                radar[radar_cols],
-                pinned_left=['Industry','Sector Opportunity Score'],
-                score_columns=['Sector Opportunity Score'],
-                height=335,
-                key='overview_sector_radar_grid',
-            )
+        st.caption('For the full sortable sector table, open **Sector Delivery + Volume**. The Overview intentionally shows only the decision-useful summary.')
 
         # ROTATION SNAPSHOT
         st.markdown('#### Sector Rotation Snapshot')
@@ -1491,25 +1532,35 @@ try:
             emerging = rot[rot['Rotation'] == 'EMERGING'].sort_values('Sector RS 5D %', ascending=False).head(4).index.tolist()
             weakening = rot[rot['Rotation'] == 'WEAKENING'].head(4).index.tolist()
             lagging = rot[rot['Rotation'] == 'LAGGING'].head(4).index.tolist()
-            r1, r2, r3, r4 = st.columns(4)
-            r1.success('**Leading**\n\n' + (' • '.join(leading) if leading else 'None'))
-            r2.info('**Emerging**\n\n' + (' • '.join(emerging) if emerging else 'None'))
-            r3.warning('**Weakening**\n\n' + (' • '.join(weakening) if weakening else 'None'))
-            r4.error('**Lagging**\n\n' + (' • '.join(lagging) if lagging else 'None'))
+            rotation_items = [
+                ('🟢 Leading', leading, 'Established leadership'),
+                ('🔵 Emerging', emerging, 'Improving relative strength'),
+                ('🟠 Weakening', weakening, 'Leadership losing momentum'),
+                ('⚪ Lagging', lagging, 'Relative underperformance'),
+            ]
+            rot_cols = st.columns(4)
+            for col, (title, names, note) in zip(rot_cols, rotation_items):
+                with col:
+                    with st.container(border=True):
+                        st.markdown(f'**{title}**')
+                        st.caption(note)
+                        st.write(' · '.join(names) if names else 'None')
 
         # STOCK RADAR
         st.markdown('#### Stock Opportunity Radar')
+        st.caption('Shortlist first: pinned columns show the setup, entry quality and accumulation score. Scroll right only when you want the supporting evidence.')
         if not top_stock_df.empty:
-            stock_show = top_stock_df.copy().head(12)
+            stock_show = top_stock_df.copy().head(10)
             stock_show['TradingView'] = stock_show['Symbol'].map(tradingview_url)
-            radar_cols = ['Symbol','Signal','Entry Suitability Score','Accumulation Score','Sector','Industry','Classification Source','Participation Conviction','Today % Change','Today Traded Value Cr','Latest Delivery %','Delivery Z','Volume Spike x','Volume Z','RS vs N500 20D %','RS vs N500 5D %','TradingView']
+            # Overview stays compact; deeper evidence remains in Sector Stocks / Accumulation tabs.
+            radar_cols = ['Symbol','Signal','Entry Suitability Score','Accumulation Score','Sector','Today % Change','Latest Delivery %','Volume Spike x','RS vs N500 20D %','TradingView']
             radar_cols = [c for c in radar_cols if c in stock_show.columns]
             render_frozen_grid(
                 stock_show[radar_cols],
                 pinned_left=['Symbol','Signal','Entry Suitability Score','Accumulation Score'],
-                score_columns=['Entry Suitability Score','Accumulation Score','Participation Conviction'],
+                score_columns=['Entry Suitability Score','Accumulation Score'],
                 link_columns=['TradingView'],
-                height=440,
+                height=385,
                 key='overview_stock_radar_grid',
             )
         else:
