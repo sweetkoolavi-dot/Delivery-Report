@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urljoin
+from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -14,13 +16,21 @@ import altair as alt
 from bs4 import BeautifulSoup
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
-st.set_page_config(page_title='Market Intelligence Terminal v9.1', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Market Intelligence Terminal v10.1', page_icon='📈', layout='wide')
 
 NIFTY500_CSV = 'https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv'
 NSE_EQUITY_LIST_CSV = 'https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv'
 BENCHMARK = '^CRSLDX'
 VIX = '^INDIAVIX'
 NSE_BHAVCOPY_URL = 'https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv'
+MASTER_CLASSIFICATION_DIR = Path.home() / '.market_intelligence_terminal'
+MASTER_CLASSIFICATION_FILE = MASTER_CLASSIFICATION_DIR / 'stock_classification_master.csv'
+BUNDLED_MASTER_FILE = Path(__file__).with_name('stock_classification_master.csv')
+FPI_HISTORY_FILE = MASTER_CLASSIFICATION_DIR / 'fpi_sector_money_push.csv'
+BUNDLED_FPI_HISTORY_FILE = Path(__file__).with_name('fpi_sector_money_push.csv')
+CDSL_FPI_INDEX = 'https://www.cdslindia.com/Publications/ForeignPortInvestor.html'
+CDSL_FPI_BASE = 'https://www.cdslindia.com/'
+NSDL_FPI_PAGE = 'https://www.fpi.nsdl.co.in/web/Reports/FPI_Fortnightly_Selection.aspx'
 
 
 @dataclass
@@ -59,38 +69,455 @@ def classify_dashboard_state(score: float, warning: float):
     return 'ULTRA BEARISH', 'High-risk environment. Avoid aggressive longs.'
 
 
-def derive_sector(industry):
-    """Map detailed industry labels into stable broad sectors for easier comparison."""
-    if industry is None or (isinstance(industry, float) and np.isnan(industry)):
+def canonical_industry(industry, sector=None):
+    """Normalize external industry labels into one stable taxonomy used everywhere."""
+    raw = industry if pd.notna(industry) else sector
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
         return np.nan
-    x = str(industry).strip()
-    if not x or x.lower() in {'nan','none','unknown'}:
+    x = str(raw).strip()
+    if not x or x.lower() in {'nan','none','unknown','n/a','na','-'}:
         return np.nan
-    u = x.upper()
+    u = re.sub(r'[^A-Z0-9 &/+.-]', ' ', x.upper())
     rules = [
-        ('FINANCIAL SERVICES', ['BANK','FINANCE','FINANCIAL','INSURANCE','CAPITAL MARKET','ASSET MANAGEMENT','NBFC']),
-        ('INFORMATION TECHNOLOGY', ['INFORMATION TECHNOLOGY','SOFTWARE','IT SERVICES','COMPUTER']),
-        ('HEALTHCARE', ['PHARMA','HEALTHCARE','HOSPITAL','BIOTECH','DIAGNOSTIC']),
-        ('AUTOMOBILE & AUTO COMPONENTS', ['AUTOMOBILE','AUTO COMPONENT','TYRE']),
-        ('FMCG / CONSUMER', ['FMCG','FAST MOVING','FOOD PRODUCTS','BEVERAGE','HOUSEHOLD','PERSONAL PRODUCTS','CONSUMER DURABLE','CONSUMER SERVICES','RETAIL']),
-        ('CAPITAL GOODS / INDUSTRIALS', ['CAPITAL GOODS','INDUSTRIAL','ELECTRICAL EQUIPMENT','AEROSPACE','DEFENCE','ENGINEERING']),
-        ('CONSTRUCTION / REALTY', ['CONSTRUCTION','REALTY','REAL ESTATE','CEMENT','CONSTRUCTION MATERIAL']),
-        ('METALS & MINING', ['METAL','MINING','MINERALS','IRON','STEEL','ALUMIN']),
-        ('ENERGY / POWER', ['POWER','OIL','GAS','ENERGY','PETROLEUM','COAL']),
-        ('CHEMICALS', ['CHEMICAL','FERTILIZER','PESTICIDE']),
-        ('TELECOM', ['TELECOM']),
-        ('MEDIA', ['MEDIA','ENTERTAINMENT']),
-        ('TEXTILES', ['TEXTILE','APPAREL']),
-        ('SERVICES', ['SERVICES','LOGISTICS','TRANSPORT','TRAVEL']),
+        ('Banks', ['BANK']),
+        ('NBFC & Lending', ['NBFC','NON BANKING','HOUSING FINANCE','MICROFINANCE','MICRO FINANCE','LENDING','FINANCE COMPANY']),
+        ('Insurance', ['INSURANCE']),
+        ('Capital Markets & Asset Management', ['CAPITAL MARKET','ASSET MANAGEMENT','BROKING','BROKERAGE','DEPOSITORY','EXCHANGE']),
+        ('IT Services & Software', ['INFORMATION TECHNOLOGY','IT SERVICES','SOFTWARE','COMPUTER SERVICES','DIGITAL SERVICES']),
+        ('Electronic Equipment & EMS', ['ELECTRONIC','EMS','ELECTRONICS']),
+        ('Pharmaceuticals', ['PHARMA','DRUGS']),
+        ('Hospitals & Healthcare Services', ['HOSPITAL','HEALTHCARE SERVICES','DIAGNOSTIC','PATHOLOGY']),
+        ('Biotechnology', ['BIOTECH']),
+        ('Automobile OEM', ['AUTOMOBILE','AUTO OEM','PASSENGER VEHICLE','COMMERCIAL VEHICLE','TWO WHEELER','TRACTOR']),
+        ('Auto Components & Tyres', ['AUTO COMPONENT','AUTO ANCILLARY','TYRE','TIRE','BATTERY']),
+        ('FMCG', ['FMCG','FAST MOVING','HOUSEHOLD PRODUCTS','PERSONAL PRODUCTS']),
+        ('Food & Beverages', ['FOOD','BEVERAGE','BREWERY','DAIRY','EDIBLE OIL']),
+        ('Consumer Durables', ['CONSUMER DURABLE','APPLIANCE','CERAMIC','SANITARYWARE']),
+        ('Retail', ['RETAIL','E-COMMERCE','ECOMMERCE']),
+        ('Hotels, Resorts & Travel', ['HOTEL','RESORT','TRAVEL','TOURISM','AIRLINE']),
+        ('Electrical Equipment', ['ELECTRICAL EQUIPMENT','CABLE','WIRE','TRANSFORMER','SWITCHGEAR']),
+        ('Engineering & Industrial Equipment', ['ENGINEERING','INDUSTRIAL EQUIPMENT','MACHINERY','BEARINGS','COMPRESSOR']),
+        ('Aerospace & Defence', ['AEROSPACE','DEFENCE','DEFENSE']),
+        ('Construction & Infrastructure', ['CONSTRUCTION','INFRASTRUCTURE','EPC','ROADS','HIGHWAY']),
+        ('Cement & Building Materials', ['CEMENT','BUILDING MATERIAL','PLYWOOD','LAMINATE','GLASS']),
+        ('Real Estate', ['REAL ESTATE','REALTY']),
+        ('Steel', ['STEEL','IRON & STEEL','IRON AND STEEL']),
+        ('Non-Ferrous Metals', ['ALUMIN','COPPER','ZINC','NON FERROUS','NON-FERROUS']),
+        ('Mining & Minerals', ['MINING','MINERALS','ORE']),
+        ('Oil & Gas', ['OIL','GAS','PETROLEUM','REFINERY','LUBRICANT']),
+        ('Power', ['POWER','ELECTRICITY','ELECTRIC UTILITY','THERMAL POWER']),
+        ('Renewable Energy', ['RENEWABLE','SOLAR','WIND ENERGY','GREEN ENERGY']),
+        ('Chemicals', ['CHEMICAL','SPECIALTY CHEM','SPECIALITY CHEM']),
+        ('Fertilizers & Agrochemicals', ['FERTILIZER','FERTILISER','PESTICIDE','AGROCHEM']),
+        ('Telecommunication', ['TELECOM','TELECOMMUNICATION']),
+        ('Media & Entertainment', ['MEDIA','ENTERTAINMENT','BROADCAST','FILM','MUSIC']),
+        ('Textiles & Apparel', ['TEXTILE','APPAREL','GARMENT','YARN']),
+        ('Logistics & Transportation', ['LOGISTICS','TRANSPORT','SHIPPING','PORT','RAIL','COURIER']),
+        ('Packaging', ['PACKAGING','CONTAINER']),
+        ('Paper & Forest Products', ['PAPER','FOREST PRODUCT']),
+        ('Education & Business Services', ['EDUCATION','BUSINESS SERVICES','STAFFING','FACILITY MANAGEMENT']),
+        ('Other Financial Services', ['FINANCIAL SERVICES']),
+        ('Other Technology', ['TECHNOLOGY']),
+        ('Other Healthcare', ['HEALTH CARE','HEALTHCARE']),
+        ('Other Consumer', ['CONSUMER CYCLICAL','CONSUMER DEFENSIVE','CONSUMER DISCRETIONARY','CONSUMER STAPLES']),
+        ('Other Materials', ['BASIC MATERIALS','MATERIALS']),
+        ('Other Industrials', ['INDUSTRIALS']),
+        ('Diversified', ['DIVERSIFIED','CONGLOMERATE']),
     ]
-    for sector, keys in rules:
+    for name, keys in rules:
         if any(k in u for k in keys):
-            return sector
-    return x
+            return name
+    return 'Other Services / Manufacturing'
+
+
+def canonical_sector(industry=None, sector=None):
+    """Map every stock into one controlled broad-sector list."""
+    ind = canonical_industry(industry, sector)
+    if pd.isna(ind):
+        return np.nan
+    mapping = {
+        'Banks':'Financial Services','NBFC & Lending':'Financial Services','Insurance':'Financial Services','Capital Markets & Asset Management':'Financial Services',
+        'IT Services & Software':'Information Technology','Electronic Equipment & EMS':'Information Technology',
+        'Pharmaceuticals':'Healthcare','Hospitals & Healthcare Services':'Healthcare','Biotechnology':'Healthcare',
+        'Automobile OEM':'Automobile & Auto Components','Auto Components & Tyres':'Automobile & Auto Components',
+        'FMCG':'Consumer','Food & Beverages':'Consumer','Consumer Durables':'Consumer','Retail':'Consumer','Hotels, Resorts & Travel':'Consumer',
+        'Electrical Equipment':'Capital Goods','Engineering & Industrial Equipment':'Capital Goods','Aerospace & Defence':'Capital Goods',
+        'Construction & Infrastructure':'Construction & Realty','Cement & Building Materials':'Construction & Realty','Real Estate':'Construction & Realty',
+        'Steel':'Metals & Mining','Non-Ferrous Metals':'Metals & Mining','Mining & Minerals':'Metals & Mining',
+        'Oil & Gas':'Energy','Power':'Energy','Renewable Energy':'Energy',
+        'Chemicals':'Chemicals','Fertilizers & Agrochemicals':'Chemicals',
+        'Telecommunication':'Telecommunication','Media & Entertainment':'Media & Entertainment',
+        'Textiles & Apparel':'Textiles','Logistics & Transportation':'Transportation & Logistics',
+        'Packaging':'Materials','Paper & Forest Products':'Materials','Education & Business Services':'Services',
+        'Other Financial Services':'Financial Services','Other Technology':'Information Technology','Other Healthcare':'Healthcare','Other Consumer':'Consumer',
+        'Other Materials':'Materials','Other Industrials':'Capital Goods',
+        'Diversified':'Diversified','Other Services / Manufacturing':'Other / Diversified',
+    }
+    return mapping.get(ind, 'Other / Diversified')
+
+
+def derive_sector(industry):
+    return canonical_sector(industry=industry)
+
+
+def normalize_classification_frame(df: pd.DataFrame):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if 'Industry' not in out.columns:
+        out['Industry'] = np.nan
+    if 'Sector' not in out.columns:
+        out['Sector'] = np.nan
+    out['Industry'] = [canonical_industry(i, s) for i, s in zip(out['Industry'], out['Sector'])]
+    out['Sector'] = [canonical_sector(i, s) for i, s in zip(out['Industry'], out['Sector'])]
+    if 'Classification Source' not in out.columns:
+        out['Classification Source'] = np.nan
+    if 'Classification Status' not in out.columns:
+        out['Classification Status'] = np.where(out['Industry'].notna() & out['Sector'].notna(), 'Mapped', 'Unmapped')
+    return out
+
+
+def load_persisted_master():
+    for candidate in [MASTER_CLASSIFICATION_FILE, BUNDLED_MASTER_FILE]:
+        try:
+            if candidate.exists():
+                x = pd.read_csv(candidate)
+                if 'Symbol' in x.columns:
+                    x['Symbol'] = x['Symbol'].astype(str).str.strip()
+                    return normalize_classification_frame(x)
+        except Exception:
+            continue
+    return pd.DataFrame(columns=['Symbol','Industry','Sector','Classification Source','Classification Status','Updated At'])
+
+
+def build_master_classification():
+    """One master map. Official Nifty data has priority, then persisted fallbacks."""
+    official = pd.concat([
+        load_constituents()[['Symbol','Industry','Sector','Classification Source']],
+        load_extended_classification()[['Symbol','Industry','Sector','Classification Source']],
+    ], ignore_index=True)
+    official = normalize_classification_frame(official)
+    official['Priority'] = 3
+    saved = load_persisted_master()
+    if not saved.empty:
+        saved['Priority'] = 2
+    combined = pd.concat([official, saved], ignore_index=True, sort=False)
+    combined['Symbol'] = combined['Symbol'].astype(str).str.strip()
+    combined = combined.sort_values(['Symbol','Priority'], ascending=[True,False]).drop_duplicates('Symbol', keep='first')
+    return combined.drop(columns=['Priority'], errors='ignore')
+
+
+def apply_master_classification(df: pd.DataFrame, master: pd.DataFrame):
+    if df is None or df.empty:
+        return df
+    out = df.drop(columns=['Industry','Sector','Classification Source','Classification Status'], errors='ignore').copy()
+    cols = [c for c in ['Symbol','Industry','Sector','Classification Source','Classification Status'] if c in master.columns]
+    out = out.merge(master[cols].drop_duplicates('Symbol'), on='Symbol', how='left')
+    return normalize_classification_frame(out)
+
+
+def persist_profile_updates(profiles: pd.DataFrame):
+    """Save fallback mappings once so all tabs reuse the exact same classification next time."""
+    if profiles is None or profiles.empty:
+        return
+    x = profiles.rename(columns={
+        'Resolved Industry':'Industry','Resolved Sector':'Sector','Resolved Source':'Classification Source'
+    }).copy()
+    keep = [c for c in ['Symbol','Industry','Sector','Classification Source'] if c in x.columns]
+    x = x[keep]
+    x = normalize_classification_frame(x)
+    x = x[x['Industry'].notna() & x['Sector'].notna()].copy()
+    if x.empty:
+        return
+    x['Classification Status'] = 'Fallback verified'
+    x['Updated At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    old = load_persisted_master()
+    merged = pd.concat([x, old], ignore_index=True, sort=False).drop_duplicates('Symbol', keep='first')
+    try:
+        MASTER_CLASSIFICATION_DIR.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(MASTER_CLASSIFICATION_FILE, index=False)
+    except Exception:
+        pass
 
 
 def tradingview_url(symbol):
     return f"https://www.tradingview.com/chart/?symbol=NSE%3A{quote(str(symbol).strip())}"
+
+
+def _fpi_number(x):
+    """Parse Indian-formatted values such as 1,23,456 or -2,341 into floats."""
+    if x is None:
+        return np.nan
+    t = str(x).strip().replace(',', '').replace('₹','').replace('INR','').strip()
+    if not t or t.lower() in {'nan','none','-','--'}:
+        return np.nan
+    neg = t.startswith('(') and t.endswith(')')
+    if neg:
+        t = t[1:-1]
+    t = re.sub(r'[^0-9.+-]', '', t)
+    try:
+        v = float(t)
+        return -v if neg else v
+    except Exception:
+        return np.nan
+
+
+def canonical_fpi_sector(source_sector):
+    """Map CDSL/BSE source sectors into the same broad sectors used by the terminal."""
+    x = str(source_sector or '').strip()
+    direct = {
+        'Automobile and Auto Components': 'Automobile & Auto Components',
+        'Capital Goods': 'Capital Goods',
+        'Chemicals': 'Chemicals',
+        'Construction': 'Construction & Realty',
+        'Construction Materials': 'Construction & Realty',
+        'Consumer Durables': 'Consumer',
+        'Consumer Services': 'Consumer',
+        'Diversified': 'Diversified',
+        'Fast Moving Consumer Goods': 'Consumer',
+        'Financial Services': 'Financial Services',
+        'Forest Materials': 'Materials',
+        'Healthcare': 'Healthcare',
+        'Information Technology': 'Information Technology',
+        'Media, Entertainment & Publication': 'Media & Entertainment',
+        'Metals & Mining': 'Metals & Mining',
+        'Oil, Gas & Consumable Fuels': 'Energy',
+        'Power': 'Energy',
+        'Realty': 'Construction & Realty',
+        'Services': 'Services',
+        'Telecommunication': 'Telecommunication',
+        'Textiles': 'Textiles',
+        'Utilities': 'Energy',
+        'Sovereign': 'Other / Diversified',
+        'Others': 'Other / Diversified',
+    }
+    if x in direct:
+        return direct[x]
+    return canonical_sector(industry=x, sector=x)
+
+
+def load_fpi_history():
+    cols = ['Date','Source Sector','Sector','Net Equity Investment Cr','Prior AUC Equity Cr','Current AUC Equity Cr','Flow Intensity %','Source URL']
+    frames = []
+    for candidate in [FPI_HISTORY_FILE, BUNDLED_FPI_HISTORY_FILE]:
+        try:
+            if candidate.exists():
+                z = pd.read_csv(candidate)
+                if set(['Date','Source Sector','Net Equity Investment Cr']).issubset(z.columns):
+                    frames.append(z)
+                    break
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    x = frames[0].copy()
+    x['Date'] = pd.to_datetime(x['Date'], errors='coerce')
+    for c in ['Net Equity Investment Cr','Prior AUC Equity Cr','Current AUC Equity Cr','Flow Intensity %']:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors='coerce')
+    if 'Sector' not in x.columns:
+        x['Sector'] = x['Source Sector'].map(canonical_fpi_sector)
+    x['Sector'] = x['Source Sector'].map(canonical_fpi_sector)
+    if 'Flow Intensity %' not in x.columns:
+        x['Flow Intensity %'] = x['Net Equity Investment Cr'] / x['Prior AUC Equity Cr'].replace(0,np.nan) * 100
+    return x.dropna(subset=['Date','Source Sector']).sort_values(['Date','Source Sector']).drop_duplicates(['Date','Source Sector'], keep='last')
+
+
+def save_fpi_history(df):
+    if df is None or df.empty:
+        return
+    try:
+        MASTER_CLASSIFICATION_DIR.mkdir(parents=True, exist_ok=True)
+        out = df.copy()
+        out['Date'] = pd.to_datetime(out['Date']).dt.strftime('%Y-%m-%d')
+        out.to_csv(FPI_HISTORY_FILE, index=False)
+    except Exception:
+        pass
+
+
+def _extract_report_date(label, url):
+    candidates = [str(label or ''), str(url or '')]
+    months = r'Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?'
+    for text in candidates:
+        text = text.replace('%20',' ').replace('%2C',',').replace('%2c',',')
+        m = re.search(rf'({months})\s+(\d{{1,2}}),?\s+(\d{{4}})', text, flags=re.I)
+        if m:
+            try:
+                return pd.to_datetime(f'{m.group(1)} {m.group(2)} {m.group(3)}')
+            except Exception:
+                pass
+    return pd.NaT
+
+
+def discover_cdsl_fpi_reports(max_reports=24):
+    headers = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64)','Accept':'text/html,*/*'}
+    r = requests.get(CDSL_FPI_INDEX, headers=headers, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, 'html.parser')
+    rows = []
+    for a in soup.find_all('a', href=True):
+        href = str(a.get('href',''))
+        txt = ' '.join(a.stripped_strings)
+        if 'FortnightlySecWisePages' not in href and 'FortnightlySecWise' not in href:
+            continue
+        url = urljoin(CDSL_FPI_BASE, href)
+        dt = _extract_report_date(txt, url)
+        if pd.notna(dt):
+            rows.append((dt, url))
+    # CDSL occasionally repeats links; keep one per reporting date.
+    uniq = {}
+    for dt,url in rows:
+        uniq[pd.Timestamp(dt).normalize()] = url
+    return sorted(uniq.items(), key=lambda x:x[0], reverse=True)[:int(max_reports)]
+
+
+def parse_cdsl_fpi_report(report_date, url):
+    """Parse current-fortnight equity net investment from CDSL's sector-wise FPI page."""
+    headers = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64)','Accept':'text/html,*/*'}
+    r = requests.get(url, headers=headers, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, 'html.parser')
+    target = None
+    for table in soup.find_all('table'):
+        txt = ' '.join(table.stripped_strings)
+        if 'Sectors' in txt and 'Net Investment' in txt and 'AUC as on' in txt:
+            target = table
+            break
+    if target is None:
+        raise ValueError('Sector-wise FPI table not found on CDSL page')
+    out=[]
+    for tr in target.find_all('tr'):
+        cells = [' '.join(c.stripped_strings) for c in tr.find_all(['td','th'])]
+        if len(cells) < 80:
+            continue
+        sr = re.sub(r'\D','',cells[0])
+        if not sr:
+            continue
+        source_sector = cells[1].strip()
+        if not source_sector or source_sector.lower() in {'sectors','grand total','total'}:
+            continue
+        vals = [_fpi_number(v) for v in cells[2:]]
+        # The current CDSL layout has 8 blocks of 12 values each:
+        # prior AUC INR/USD, prior net INR/USD, current net INR/USD, current AUC INR/USD.
+        if len(vals) < 84:
+            continue
+        prior_auc_eq = vals[0]
+        current_net_eq = vals[48] if len(vals) > 48 else np.nan
+        current_auc_eq = vals[72] if len(vals) > 72 else np.nan
+        # Defensive fallback: AUC relationship can identify the current equity net-flow block
+        # if CDSL adds columns later. Keep known layout as first choice.
+        flow_intensity = current_net_eq / prior_auc_eq * 100 if pd.notna(current_net_eq) and pd.notna(prior_auc_eq) and prior_auc_eq != 0 else np.nan
+        out.append({
+            'Date': pd.Timestamp(report_date).normalize(),
+            'Source Sector': source_sector,
+            'Sector': canonical_fpi_sector(source_sector),
+            'Net Equity Investment Cr': current_net_eq,
+            'Prior AUC Equity Cr': prior_auc_eq,
+            'Current AUC Equity Cr': current_auc_eq,
+            'Flow Intensity %': flow_intensity,
+            'Source URL': url,
+        })
+    if not out:
+        raise ValueError('No sector rows parsed from CDSL FPI report')
+    return pd.DataFrame(out)
+
+
+def refresh_fpi_history(max_reports=24):
+    reports = discover_cdsl_fpi_reports(max_reports=max_reports)
+    if not reports:
+        raise ValueError('No CDSL fortnightly sector reports discovered')
+    old = load_fpi_history()
+    existing_dates = set(pd.to_datetime(old['Date']).dt.normalize()) if not old.empty else set()
+    to_fetch = [(d,u) for d,u in reports if pd.Timestamp(d).normalize() not in existing_dates]
+    frames=[]
+    # Fetch a small number of static fortnightly pages in parallel; this does not affect normal startup.
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {ex.submit(parse_cdsl_fpi_report,d,u):(d,u) for d,u in to_fetch}
+        for fut in as_completed(futs):
+            try:
+                frames.append(fut.result())
+            except Exception:
+                pass
+    if frames:
+        new = pd.concat(frames, ignore_index=True)
+        merged = pd.concat([old,new], ignore_index=True, sort=False) if not old.empty else new
+    else:
+        merged = old
+    if merged is None or merged.empty:
+        raise ValueError('Could not download FPI sector history. Try again later or use manual CSV import.')
+    merged['Date'] = pd.to_datetime(merged['Date'], errors='coerce')
+    merged = merged.dropna(subset=['Date','Source Sector']).drop_duplicates(['Date','Source Sector'], keep='last').sort_values(['Date','Source Sector'])
+    merged['Sector'] = merged['Source Sector'].map(canonical_fpi_sector)
+    merged['Flow Intensity %'] = merged['Net Equity Investment Cr'] / merged['Prior AUC Equity Cr'].replace(0,np.nan) * 100
+    save_fpi_history(merged)
+    return merged, len(frames)
+
+
+def import_fpi_csv(uploaded):
+    x = pd.read_csv(uploaded)
+    rename = {c:c.strip() for c in x.columns}
+    x = x.rename(columns=rename)
+    required = {'Date','Source Sector','Net Equity Investment Cr'}
+    if not required.issubset(x.columns):
+        raise ValueError('CSV must contain Date, Source Sector and Net Equity Investment Cr columns.')
+    if 'Prior AUC Equity Cr' not in x.columns:
+        x['Prior AUC Equity Cr'] = np.nan
+    if 'Current AUC Equity Cr' not in x.columns:
+        x['Current AUC Equity Cr'] = np.nan
+    if 'Source URL' not in x.columns:
+        x['Source URL'] = 'Manual import'
+    x['Date'] = pd.to_datetime(x['Date'], errors='coerce')
+    x['Sector'] = x['Source Sector'].map(canonical_fpi_sector)
+    x['Flow Intensity %'] = pd.to_numeric(x['Net Equity Investment Cr'], errors='coerce') / pd.to_numeric(x['Prior AUC Equity Cr'], errors='coerce').replace(0,np.nan) * 100
+    old=load_fpi_history()
+    merged=pd.concat([old,x],ignore_index=True,sort=False).dropna(subset=['Date','Source Sector']).drop_duplicates(['Date','Source Sector'],keep='last').sort_values(['Date','Source Sector'])
+    save_fpi_history(merged)
+    return merged
+
+
+def fpi_sector_summary(hist, group_col='Sector'):
+    if hist is None or hist.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    x=hist.copy()
+    x['Date']=pd.to_datetime(x['Date'])
+    g=x.groupby(['Date',group_col],as_index=False).agg(
+        **{'Net Flow Cr':('Net Equity Investment Cr','sum'),
+           'Prior AUC Cr':('Prior AUC Equity Cr','sum'),
+           'Current AUC Cr':('Current AUC Equity Cr','sum')}
+    )
+    g['Flow Intensity %']=g['Net Flow Cr']/g['Prior AUC Cr'].replace(0,np.nan)*100
+    flow=g.pivot(index='Date',columns=group_col,values='Net Flow Cr').sort_index()
+    intensity=g.pivot(index='Date',columns=group_col,values='Flow Intensity %').sort_index()
+    rows=[]
+    for sec in flow.columns:
+        f=flow[sec].dropna()
+        it=intensity[sec].reindex(f.index)
+        if f.empty:
+            continue
+        latest=float(f.iloc[-1])
+        latest_int=float(it.iloc[-1]) if pd.notna(it.iloc[-1]) else np.nan
+        sum3=float(f.tail(3).sum())
+        sum6=float(f.tail(6).sum())
+        int3=float(it.tail(3).sum(min_count=1)) if it.tail(3).notna().any() else np.nan
+        pos6=float((f.tail(6)>0).mean()*100)
+        avg3=float(f.tail(3).mean())
+        prev3=float(f.iloc[-6:-3].mean()) if len(f)>=6 else np.nan
+        accel=avg3-prev3 if pd.notna(prev3) else np.nan
+        rows.append({group_col:sec,'Latest Flow Cr':latest,'Latest Flow Intensity %':latest_int,'3F Net Flow Cr':sum3,'6F Net Flow Cr':sum6,'3F Flow Intensity Sum %':int3,'Positive Fortnights 6F %':pos6,'Flow Acceleration Cr':accel})
+    summary=pd.DataFrame(rows)
+    if summary.empty:
+        return g, summary
+    # Cross-sectional percentile score: normalized intensity + sustained flows + consistency + acceleration.
+    def pct_rank(series):
+        return series.rank(pct=True, method='average').fillna(0.5)*100
+    summary['FPI Money Push Score']=(
+        pct_rank(summary['Latest Flow Intensity %'])*0.30+
+        pct_rank(summary['3F Flow Intensity Sum %'])*0.30+
+        summary['Positive Fortnights 6F %'].fillna(50)*0.20+
+        pct_rank(summary['Flow Acceleration Cr'])*0.20
+    ).clip(0,100)
+    summary=summary.sort_values('FPI Money Push Score',ascending=False)
+    return g,summary
 
 
 MONEYCONTROL_SUGGEST = 'https://www.moneycontrol.com/mccode/common/autosuggestion_solr.php'
@@ -241,6 +668,7 @@ def apply_profile_enrichment(df: pd.DataFrame, profiles: pd.DataFrame):
         out['Classification Source'] = np.nan
     out['Classification Source'] = out['Classification Source'].where(out['Classification Source'].notna(), out['Resolved Source'])
     out['Sector'] = out['Sector'].where(out['Sector'].notna(), out['Industry'].map(derive_sector))
+    out = normalize_classification_frame(out)
     return out.drop(columns=['Resolved Industry','Resolved Sector','Resolved Source'], errors='ignore')
 
 
@@ -623,6 +1051,7 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     avg20_delivery = tail20.groupby('SYMBOL')['DELIV_PER'].mean()
     std20_delivery = tail20.groupby('SYMBOL')['DELIV_PER'].std().replace(0, np.nan)
     avg5_delivery = tail5.groupby('SYMBOL')['DELIV_PER'].mean()
+    prev5_delivery = tail10.groupby('SYMBOL')['DELIV_PER'].apply(lambda x: x.iloc[-10:-5].mean() if len(x) >= 10 else np.nan)
     avg20_vol = tail20.groupby('SYMBOL')['TTL_TRD_QNTY'].mean()
     std20_vol = tail20.groupby('SYMBOL')['TTL_TRD_QNTY'].std().replace(0, np.nan)
     avg5_vol = tail5.groupby('SYMBOL')['TTL_TRD_QNTY'].mean()
@@ -636,7 +1065,9 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     out['Latest Delivery %'] = latest['DELIV_PER']
     out['5D Avg Delivery %'] = avg5_delivery
     out['20D Avg Delivery %'] = avg20_delivery
-    out['Delivery Acceleration'] = out['Latest Delivery %'] - out['20D Avg Delivery %']
+    out['Delivery Acceleration 5D'] = out['5D Avg Delivery %'] - prev5_delivery.reindex(out.index)
+    out['Delivery Acceleration vs 20D'] = out['5D Avg Delivery %'] - out['20D Avg Delivery %']
+    out['Delivery Acceleration'] = 0.65*out['Delivery Acceleration 5D'] + 0.35*out['Delivery Acceleration vs 20D']
     out['Delivery Z'] = (out['Latest Delivery %'] - avg20_delivery) / std20_delivery
     out['Volume Spike x'] = latest['TTL_TRD_QNTY'] / avg20_vol.replace(0,np.nan)
     out['5D Volume x'] = avg5_vol / avg20_vol.replace(0,np.nan)
@@ -679,10 +1110,13 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     merge_cols = [c for c in ['Symbol','Sector','Industry','Classification Source'] if c in meta.columns]
     out = out.reset_index().rename(columns={'SYMBOL':'Symbol'}).merge(meta[merge_cols], on='Symbol', how='left')
 
-    # Sector-relative strength where an industry mapping exists; unmapped broad-NSE names stay N/A.
-    sector_ret = out.dropna(subset=['Industry']).groupby('Industry')['1M Price Change %'].median()
-    out['Sector 20D Return %'] = out['Industry'].map(sector_ret)
+    # Uniform relative strength: stock vs canonical sector and vs canonical industry.
+    sector_ret = out.dropna(subset=['Sector']).groupby('Sector')['1M Price Change %'].median()
+    industry_ret = out.dropna(subset=['Industry']).groupby('Industry')['1M Price Change %'].median()
+    out['Sector 20D Return %'] = out['Sector'].map(sector_ret)
+    out['Industry 20D Return %'] = out['Industry'].map(industry_ret)
     out['RS vs Sector 20D %'] = out['1M Price Change %'] - out['Sector 20D Return %']
+    out['RS vs Industry 20D %'] = out['1M Price Change %'] - out['Industry 20D Return %']
 
     # Stage-1 accumulation score: all components are cheap and cross-sectional.
     d20p = percentile_series(out['20D Avg Delivery %'])
@@ -692,9 +1126,10 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     rsp = percentile_series(out['RS vs N500 20D %'])
     rap = percentile_series(out['RS Acceleration'])
     persistp = percentile_series(out['Delivery Persistence 10D'] + out['Volume Persistence 10D'])
-    out['Participation Conviction'] = (0.25*dzp + 0.35*vzp + 0.25*tvp + 0.15*persistp).round(1)
-    # Delivery cannot dominate the score unless actual market participation is present.
-    out['Accumulation Score'] = (0.18*d20p + 0.10*dzp + 0.22*vzp + 0.15*tvp + 0.17*rsp + 0.10*rap + 0.08*persistp).round(1)
+    daccp = percentile_series(out['Delivery Acceleration'])
+    out['Participation Conviction'] = (0.20*dzp + 0.30*vzp + 0.22*tvp + 0.13*persistp + 0.15*daccp).round(1)
+    # Delivery acceleration is rewarded, but only alongside meaningful volume/traded value and RS.
+    out['Accumulation Score'] = (0.14*d20p + 0.09*dzp + 0.18*vzp + 0.13*tvp + 0.16*rsp + 0.10*rap + 0.08*persistp + 0.12*daccp).round(1)
 
     def opportunity_type(r):
         rs20 = r.get('RS vs N500 20D %', -99)
@@ -702,6 +1137,7 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
         dz = r.get('Delivery Z', -99)
         vz = r.get('Volume Z', -99)
         d20 = r.get('20D Avg Delivery %', 0)
+        dacc = r.get('Delivery Acceleration', -99)
         p20 = r.get('1M Price Change %', -999)
         p5 = r.get('5D Price Change %', -999)
         p0 = r.get('Today % Change', -999)
@@ -712,9 +1148,9 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
             return '🔴 DISTRIBUTION RISK'
         if p20 > 15 or p5 > 8 or r.get('Price Extension vs 20DMA %', 0) > 10:
             return '🟠 EXTENDED'
-        if 0 <= p20 <= 7 and d20 >= 45 and dz >= 0.5 and vz >= 0.8 and rsa > 0 and traded >= 1:
+        if 0 <= p20 <= 7 and d20 >= 45 and dz >= 0.5 and vz >= 0.8 and rsa > 0 and dacc > 0 and traded >= 1:
             return '🟣 EARLY ACCUMULATION'
-        if rs20 > 0 and rsa > 0 and near_high and contraction and d20 >= 40:
+        if rs20 > 0 and rsa > 0 and dacc >= 0 and near_high and contraction and d20 >= 40:
             return '🔵 SETUP READY'
         if rs20 > 0 and rsa > 0 and near_high and r.get('Volume Spike x',0) >= 1.3 and dz >= 0 and traded >= 1:
             return '🟢 MOMENTUM ENTRY'
@@ -725,6 +1161,20 @@ def broad_stock_summary(bhav: pd.DataFrame, meta: pd.DataFrame, benchmark_close:
     out['Signal'] = out['Opportunity Type']
     out = add_entry_scores(out)
     return out.sort_values(['Entry Suitability Score','Accumulation Score'], ascending=False)
+
+
+def recompute_uniform_relative_strength(df: pd.DataFrame):
+    if df is None or df.empty:
+        return df
+    out = normalize_classification_frame(df)
+    if '1M Price Change %' in out.columns:
+        sector_ret = out.dropna(subset=['Sector']).groupby('Sector')['1M Price Change %'].median()
+        industry_ret = out.dropna(subset=['Industry']).groupby('Industry')['1M Price Change %'].median()
+        out['Sector 20D Return %'] = out['Sector'].map(sector_ret)
+        out['Industry 20D Return %'] = out['Industry'].map(industry_ret)
+        out['RS vs Sector 20D %'] = out['1M Price Change %'] - out['Sector 20D Return %']
+        out['RS vs Industry 20D %'] = out['1M Price Change %'] - out['Industry 20D Return %']
+    return add_entry_scores(out)
 
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
@@ -789,14 +1239,19 @@ def load_delivery_data(meta, lookback_days=40):
 def summarize_sector_delivery(delivery_long: pd.DataFrame):
     if delivery_long.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    sector_pivot = delivery_long.groupby(['Date', 'Industry'])['Delivery %'].mean().unstack('Industry').sort_index()
+    group_col = 'Sector' if 'Sector' in delivery_long.columns else 'Industry'
+    sector_pivot = delivery_long.groupby(['Date', group_col])['Delivery %'].mean().unstack(group_col).sort_index()
     sector_smooth = sector_pivot.rolling(5).mean()
     latest = sector_pivot.iloc[-1].rename('Latest Delivery %').to_frame()
     latest['5D Avg Delivery %'] = sector_smooth.iloc[-1].reindex(latest.index)
     latest['5D Trend'] = latest['Latest Delivery %'] - latest['5D Avg Delivery %']
+    prev5_avg = sector_pivot.iloc[-10:-5].mean() if len(sector_pivot) >= 10 else pd.Series(index=sector_pivot.columns, dtype=float)
+    latest['Delivery Acceleration 5D'] = latest['5D Avg Delivery %'] - prev5_avg.reindex(latest.index)
     roll20_mean = sector_pivot.rolling(20).mean()
     roll20_std = sector_pivot.rolling(20).std().replace(0, np.nan)
     latest['Delivery Z Score'] = ((sector_smooth.iloc[-1] - roll20_mean.iloc[-1]) / roll20_std.iloc[-1]).reindex(latest.index)
+    latest['Delivery Acceleration vs 20D'] = latest['5D Avg Delivery %'] - roll20_mean.iloc[-1].reindex(latest.index)
+    latest['Delivery Acceleration'] = 0.65*latest['Delivery Acceleration 5D'] + 0.35*latest['Delivery Acceleration vs 20D']
     if len(sector_pivot) >= 6:
         latest['5D Change'] = (sector_pivot.iloc[-1] - sector_pivot.iloc[-6]).reindex(latest.index)
     else:
@@ -818,9 +1273,12 @@ def summarize_stock_delivery(delivery_long: pd.DataFrame, close: pd.DataFrame, v
     latest_delivery = grouped['Delivery %'].last().rename('Latest Delivery %')
     avg5 = delivery_long.groupby('Symbol').tail(5).groupby('Symbol')['Delivery %'].mean().rename('5D Avg Delivery %')
     avg20 = delivery_long.groupby('Symbol').tail(20).groupby('Symbol')['Delivery %'].mean().rename('20D Avg Delivery %')
+    prev5 = delivery_long.groupby('Symbol').tail(10).groupby('Symbol')['Delivery %'].apply(lambda x: x.iloc[-10:-5].mean() if len(x) >= 10 else np.nan)
     count_obs = grouped['Delivery %'].count().rename('Obs')
     out = pd.concat([latest_delivery, avg5, avg20, count_obs], axis=1)
-    out['Delivery Acceleration'] = out['Latest Delivery %'] - out['20D Avg Delivery %']
+    out['Delivery Acceleration 5D'] = out['5D Avg Delivery %'] - prev5.reindex(out.index)
+    out['Delivery Acceleration vs 20D'] = out['5D Avg Delivery %'] - out['20D Avg Delivery %']
+    out['Delivery Acceleration'] = 0.65*out['Delivery Acceleration 5D'] + 0.35*out['Delivery Acceleration vs 20D']
 
     ticker_index = out.index.map(lambda x: f'{x}.NS')
     if len(close) >= 22:
@@ -859,7 +1317,7 @@ def summarize_stock_delivery(delivery_long: pd.DataFrame, close: pd.DataFrame, v
         out['RS vs N500 5D %'] = np.nan
         out['RS Improving'] = False
 
-    out = out.reset_index().merge(meta[['Symbol', 'Industry']], on='Symbol', how='left')
+    out = out.reset_index().merge(meta[['Symbol', 'Sector', 'Industry']], on='Symbol', how='left')
 
     # Combined accumulation score. Price change is intentionally not a major weight: a quiet stock
     # with high delivery + high volume + improving RS can rank highly before a large price move.
@@ -892,18 +1350,19 @@ def summarize_stock_delivery(delivery_long: pd.DataFrame, close: pd.DataFrame, v
 def build_sector_market_analytics(close: pd.DataFrame, volume: pd.DataFrame, meta: pd.DataFrame, benchmark_close: pd.Series):
     if close.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    ticker_to_industry = meta.set_index('Ticker')['Industry'].to_dict()
-    valid_cols = [c for c in close.columns if c in ticker_to_industry]
+    # Sector analytics uses the same canonical master Sector field used everywhere else.
+    ticker_to_sector = meta.set_index('Ticker')['Sector'].dropna().to_dict()
+    valid_cols = [c for c in close.columns if c in ticker_to_sector]
     c = close[valid_cols].copy()
     v = volume.reindex(index=c.index, columns=valid_cols).copy() if not volume.empty else pd.DataFrame(index=c.index, columns=valid_cols)
 
     # Equal-weight sector index from daily stock returns.
     rets = c.pct_change(fill_method=None)
     sector_ret = {}
-    for industry in sorted(set(ticker_to_industry[cx] for cx in valid_cols)):
-        cols = [cx for cx in valid_cols if ticker_to_industry[cx] == industry]
+    for sector in sorted(set(ticker_to_sector[cx] for cx in valid_cols)):
+        cols = [cx for cx in valid_cols if ticker_to_sector[cx] == sector]
         if len(cols) >= 2:
-            sector_ret[industry] = rets[cols].mean(axis=1, skipna=True)
+            sector_ret[sector] = rets[cols].mean(axis=1, skipna=True)
     sector_ret = pd.DataFrame(sector_ret).fillna(0)
     sector_index = (1 + sector_ret).cumprod()
 
@@ -921,7 +1380,7 @@ def build_sector_market_analytics(close: pd.DataFrame, volume: pd.DataFrame, met
         value_traded = c * v
         sector_turnover = {}
         for industry in sector_ret.columns:
-            cols = [cx for cx in valid_cols if ticker_to_industry[cx] == industry]
+            cols = [cx for cx in valid_cols if ticker_to_sector[cx] == industry]
             sector_turnover[industry] = value_traded[cols].sum(axis=1, min_count=1)
         sector_turnover = pd.DataFrame(sector_turnover)
 
@@ -952,11 +1411,28 @@ def build_sector_market_analytics(close: pd.DataFrame, volume: pd.DataFrame, met
     return rs, rs5, summary
 
 
+def build_bhav_sector_activity(bhav: pd.DataFrame, meta: pd.DataFrame):
+    """Broad-NSE sector traded-value activity using the same master sector mapping."""
+    if bhav is None or bhav.empty or meta is None or meta.empty:
+        return pd.DataFrame()
+    x = bhav.merge(meta[['Symbol','Sector']], left_on='SYMBOL', right_on='Symbol', how='left').dropna(subset=['Sector'])
+    if x.empty:
+        return pd.DataFrame()
+    turnover = x.groupby(['Date','Sector'])['TURNOVER_LACS'].sum().unstack('Sector').sort_index()
+    out = pd.DataFrame(index=turnover.columns)
+    if len(turnover) >= 20:
+        avg20 = turnover.tail(20).mean().replace(0, np.nan)
+        out['Sector Volume Spike x'] = turnover.iloc[-1] / avg20
+        out['Sector 5D Volume x'] = turnover.tail(5).mean() / avg20
+        out['Sector Traded Value Cr'] = turnover.iloc[-1] / 100.0
+    return out
+
+
 def merge_sector_scores(sector_rank: pd.DataFrame, sector_market_summary: pd.DataFrame):
     if sector_rank.empty and sector_market_summary.empty:
         return pd.DataFrame()
     out = sector_rank.join(sector_market_summary, how='outer')
-    for col in ['Latest Delivery %', '5D Avg Delivery %', 'Delivery Z Score', '5D Trend', '5D Change', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', 'Sector 5D Volume x']:
+    for col in ['Latest Delivery %', '5D Avg Delivery %', 'Delivery Z Score', 'Delivery Acceleration', 'Delivery Acceleration 5D', 'Delivery Acceleration vs 20D', '5D Trend', '5D Change', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', 'Sector 5D Volume x']:
         if col not in out.columns:
             out[col] = np.nan
     dp = percentile_series(out['5D Avg Delivery %'])
@@ -964,8 +1440,9 @@ def merge_sector_scores(sector_rank: pd.DataFrame, sector_market_summary: pd.Dat
     vp = percentile_series(out['Sector Volume Spike x'])
     rp = percentile_series(out['Sector RS 20D %'])
     r5p = percentile_series(out['Sector RS 5D %'])
-    # Delivery is useful only when participation/relative strength also confirm.
-    out['Sector Opportunity Score'] = (0.22*dp + 0.13*dzp + 0.25*vp + 0.25*rp + 0.15*r5p).round(1)
+    dap = percentile_series(out['Delivery Acceleration'])
+    # Delivery level is secondary; acceleration, volume and RS provide stronger confirmation.
+    out['Sector Opportunity Score'] = (0.15*dp + 0.12*dzp + 0.13*dap + 0.23*vp + 0.23*rp + 0.14*r5p).round(1)
     return out.sort_values(['Sector Opportunity Score', 'Sector Volume Spike x', '5D Avg Delivery %'], ascending=False)
 
 
@@ -1106,6 +1583,7 @@ def render_sector_radar_cards(sector_df: pd.DataFrame, limit=8):
                     alt.Tooltip('View:N', title='View'),
                     alt.Tooltip('5D Avg Delivery %:Q', title='Delivery 5DMA', format='.1f'),
                     alt.Tooltip('Delivery Z Score:Q', title='Delivery Z', format='+.2f'),
+                    alt.Tooltip('Delivery Acceleration:Q', title='Delivery acceleration', format='+.2f'),
                     alt.Tooltip('Sector Volume Spike x:Q', title='RVOL', format='.2f'),
                     alt.Tooltip('Sector RS 20D %:Q', title='RS 20D', format='+.2f'),
                 ],
@@ -1133,6 +1611,7 @@ def render_sector_radar_cards(sector_df: pd.DataFrame, limit=8):
             vol = r.get('Sector Volume Spike x', np.nan)
             rs = r.get('Sector RS 20D %', np.nan)
             dz = r.get('Delivery Z Score', np.nan)
+            da = r.get('Delivery Acceleration', np.nan)
             with st.container(border=True):
                 a, b = st.columns([2.0, 0.65])
                 a.markdown(f"**{r['Sector']}**  ·  {_band(score)}")
@@ -1142,6 +1621,7 @@ def render_sector_radar_cards(sector_df: pd.DataFrame, limit=8):
                 if pd.notna(vol): bits.append(f"RVOL **{vol:.2f}×**")
                 if pd.notna(rs): bits.append(f"RS **{rs:+.1f}%**")
                 if pd.notna(dz): bits.append(f"D-Z **{dz:+.1f}**")
+                if pd.notna(da): bits.append(f"D-Accel **{da:+.1f} pp**")
                 st.caption(' · '.join(bits))
 
 
@@ -1273,8 +1753,10 @@ def add_entry_scores(df: pd.DataFrame, piotroski_floor=8):
     accum = out.get('Accumulation Score', pd.Series(0,index=out.index)).fillna(0)
     rs_nifty = pct('RS vs N500 20D %')
     rs_sector = pct('RS vs Sector 20D %') if 'RS vs Sector 20D %' in out.columns else pd.Series(50,index=out.index)
+    rs_industry = pct('RS vs Industry 20D %') if 'RS vs Industry 20D %' in out.columns else pd.Series(50,index=out.index)
     rs_accel = pct('RS Acceleration') if 'RS Acceleration' in out.columns else pct('RS vs N500 5D %')
     del_abn = pct('Delivery Z') if 'Delivery Z' in out.columns else pct('Delivery Acceleration')
+    del_accel = pct('Delivery Acceleration')
     vol_abn = pct('Volume Z') if 'Volume Z' in out.columns else pct('Volume Spike x')
     persist = pct('Delivery Persistence 10D') if 'Delivery Persistence 10D' in out.columns else pct('5D Volume x')
 
@@ -1291,15 +1773,17 @@ def add_entry_scores(df: pd.DataFrame, piotroski_floor=8):
                             np.where(contraction_ratio <= 1.05, 70, 40)), index=out.index)
 
     base = (
-        0.20*accum +
-        0.12*rs_nifty +
-        0.10*rs_sector +
+        0.18*accum +
+        0.10*rs_nifty +
+        0.08*rs_sector +
+        0.07*rs_industry +
         0.10*rs_accel +
-        0.10*del_abn +
+        0.08*del_abn +
+        0.09*del_accel +
         0.10*vol_abn +
-        0.08*persist +
-        0.10*loc +
-        0.10*contraction
+        0.06*persist +
+        0.08*loc +
+        0.06*contraction
     )
 
     # Explicit extension penalty: strong stocks can still be poor entries.
@@ -1389,9 +1873,13 @@ with st.sidebar:
                                  help='Fewer sectors make the delivery chart cleaner.')
     with st.expander('Classification quality', expanded=False):
         auto_enrich_profiles = st.checkbox('Auto-fill missing sector / industry', value=True,
-                                           help='Uses structured Yahoo data first and Moneycontrol as a fallback only for the most relevant unmapped stocks.')
+                                           help='Uses one master classification table. Official Nifty mapping is first priority; Yahoo/Moneycontrol fills missing names and is saved for future runs.')
         classification_depth = st.select_slider('Auto-enrich top unmapped candidates', options=[25, 50, 75, 100, 150], value=50,
-                                                help='Higher values improve classification coverage but may add some first-run lookup time. Results are cached for 7 days.')
+                                                help='Only relevant unmapped stocks are looked up during normal startup. Results are saved to the master map and reused by every tab.')
+        master_batch_size = st.select_slider('One-time master mapping batch', options=[50,100,150,200,300], value=100,
+                                             help='Use the button below occasionally to permanently map more of the broad NSE universe. It may take time only when you click it.')
+        enrich_master_batch = st.button('Map next unmapped batch', use_container_width=True,
+                                        help='One-time enrichment. Saves results to stock_classification_master.csv so later launches stay fast.')
     refresh = st.button('Refresh all data', use_container_width=True)
     st.caption('Fast broad mode uses NSE bhavcopy for ~2,000 stocks. Classification enrichment is cached and limited to relevant names.')
 
@@ -1401,8 +1889,9 @@ if refresh:
 try:
     progress = st.progress(0, text='Opening dashboard…')
     with st.spinner('Loading core market and sector data…'):
-        broad_meta = load_broad_nse_universe().head(max_stocks).copy()
-        n500_meta = load_constituents().copy()
+        master_map = build_master_classification()
+        broad_meta = apply_master_classification(load_broad_nse_universe().head(max_stocks).copy(), master_map)
+        n500_meta = apply_master_classification(load_constituents().copy(), master_map)
         # Core regime + sector engine only needs Nifty 500, avoiding a 2,000-stock Yahoo request.
         n500_universe = tuple(n500_meta['Ticker'].tolist())
         close, volume = download_market_frames(n500_universe, '1y')
@@ -1418,37 +1907,56 @@ try:
         bhav_sessions = max(25, min(int(delivery_lookback), 35))
         broad_bhav = load_broad_bhav_history(tuple(meta['Symbol'].tolist()), sessions=bhav_sessions)
         stock_rank = broad_stock_summary(broad_bhav, meta, d['benchmark_close'], min_traded_value_cr=min_traded_value_cr)
-        # Sector delivery is based on mapped Nifty-500 names; broad unmapped names still remain in stock discovery.
-        mapped_delivery = broad_bhav.merge(n500_meta[['Symbol','Industry']], left_on='SYMBOL', right_on='Symbol', how='inner') if not broad_bhav.empty else pd.DataFrame()
-        if not mapped_delivery.empty:
-            delivery_long = mapped_delivery[['Date','SYMBOL','Industry','DELIV_PER']].rename(columns={'SYMBOL':'Symbol','DELIV_PER':'Delivery %'})
-        else:
-            delivery_long = pd.DataFrame()
+        active_bhav = broad_bhav
     else:
         meta = n500_meta
         bhav_sessions = max(25, min(int(delivery_lookback), 35))
         n500_bhav = load_broad_bhav_history(tuple(meta['Symbol'].tolist()), sessions=bhav_sessions)
         stock_rank = broad_stock_summary(n500_bhav, meta, d['benchmark_close'], min_traded_value_cr=min_traded_value_cr)
-        if not n500_bhav.empty:
-            mapped_delivery = n500_bhav.merge(n500_meta[['Symbol','Industry']], left_on='SYMBOL', right_on='Symbol', how='inner')
-            delivery_long = mapped_delivery[['Date','SYMBOL','Industry','DELIV_PER']].rename(columns={'SYMBOL':'Symbol','DELIV_PER':'Delivery %'})
-        else:
-            delivery_long = pd.DataFrame()
+        active_bhav = n500_bhav
 
-    # Auto-fill missing classifications only for the most relevant broad-market names.
+    # Optional one-time master mapping batch. This is deliberately user-triggered so normal startup stays fast.
+    if enrich_master_batch:
+        unmapped_master = meta[meta['Industry'].isna() | meta['Sector'].isna()].head(int(master_batch_size))
+        if not unmapped_master.empty:
+            progress.progress(48, text=f'Building master classification for {len(unmapped_master)} stocks…')
+            batch_profiles = enrich_profiles(unmapped_master['Symbol'].tolist(), workers=10)
+            persist_profile_updates(batch_profiles)
+            meta = apply_profile_enrichment(meta, batch_profiles)
+            if universe_mode.startswith('Broad'):
+                broad_meta = meta.copy()
+            else:
+                n500_meta = meta.copy()
+            st.sidebar.success(f'Saved classification updates for up to {len(unmapped_master)} stocks. They will be reused next time.')
+
+    # Auto-fill only relevant missing names, then persist once and reuse uniformly in every tab.
     if auto_enrich_profiles and not stock_rank.empty:
         missing_mask = stock_rank['Industry'].isna() | stock_rank['Sector'].isna()
         missing_candidates = stock_rank[missing_mask].sort_values(
             ['Entry Suitability Score','Accumulation Score','Participation Conviction'], ascending=False
         ).head(int(classification_depth))
         if not missing_candidates.empty:
-            progress.progress(62, text=f'Filling sector / industry for {len(missing_candidates)} relevant unmapped stocks…')
+            progress.progress(62, text=f'Filling master sector / industry for {len(missing_candidates)} relevant stocks…')
             prof = enrich_profiles(missing_candidates['Symbol'].tolist())
+            persist_profile_updates(prof)
             stock_rank = apply_profile_enrichment(stock_rank, prof)
+            meta = apply_profile_enrichment(meta, prof)
+            stock_rank = recompute_uniform_relative_strength(stock_rank)
 
-    progress.progress(75, text='Building sector delivery and relative-strength views…')
+    # Build delivery from the same canonical master classification used by stock/industry tabs.
+    if active_bhav is not None and not active_bhav.empty:
+        mapped_delivery = active_bhav.merge(meta[['Symbol','Sector','Industry']], left_on='SYMBOL', right_on='Symbol', how='inner')
+        mapped_delivery = mapped_delivery.dropna(subset=['Sector'])
+        delivery_long = mapped_delivery[['Date','SYMBOL','Sector','Industry','DELIV_PER']].rename(columns={'SYMBOL':'Symbol','DELIV_PER':'Delivery %'})
+    else:
+        delivery_long = pd.DataFrame()
+
+    progress.progress(75, text='Building uniform sector delivery and relative-strength views…')
     sector_pivot, sector_smooth, sector_rank = summarize_sector_delivery(delivery_long)
     sector_rs, sector_rs5, sector_market_summary = build_sector_market_analytics(close, volume, n500_meta, d['benchmark_close'])
+    broad_sector_activity = build_bhav_sector_activity(active_bhav, meta)
+    if not broad_sector_activity.empty:
+        sector_market_summary = sector_market_summary.drop(columns=['Sector Volume Spike x','Sector 5D Volume x'], errors='ignore').join(broad_sector_activity, how='outer')
     sector_opportunity = merge_sector_scores(sector_rank, sector_market_summary)
     progress.progress(100, text=f'Ready — {len(stock_rank):,} liquid stocks ranked')
     progress.empty()
@@ -1481,7 +1989,7 @@ try:
     if latest_session is not None:
         st.caption(f'Latest NSE session used for current-day % change: {latest_session.strftime("%d %b %Y")}')
 
-    tabs = st.tabs(['Overview', 'Breadth', 'Industry Gain / Loss', 'Sector Delivery + Volume', 'Sector Relative Strength', 'Sector Stocks', 'Accumulation Stocks', 'Stock News'])
+    tabs = st.tabs(['Overview', 'Breadth', 'Industry Gain / Loss', 'Sector Delivery + Volume', 'Sector Relative Strength', 'FPI Sector Money Push', 'Sector Stocks', 'Accumulation Stocks', 'Classification Map', 'Stock News'])
 
     with tabs[0]:
         # MARKET COMMAND CENTER
@@ -1498,7 +2006,7 @@ try:
 
         st.markdown('#### Opportunity Funnel')
         mapped_count, mapped_total, mapped_pct = classification_coverage(stock_rank)
-        st.caption(f"Scanning {len(meta):,} NSE EQ-series stocks. {mapped_count:,}/{mapped_total:,} ranked stocks ({mapped_pct:.0f}%) currently have both sector and industry labels. Official Nifty classification is used first; relevant missing labels are enriched from Yahoo and Moneycontrol fallback and cached.")
+        st.caption(f"Scanning {len(meta):,} NSE EQ-series stocks. {mapped_count:,}/{mapped_total:,} ranked stocks ({mapped_pct:.0f}%) use the same master Stock → Industry → Sector mapping across every tab. Official Nifty classification has first priority; saved Yahoo/Moneycontrol fallbacks fill gaps without changing labels between screens.")
         f1, f2, f3, f4, f5 = st.columns(5)
         f1.metric('Universe', f'{len(stock_rank):,}' if not stock_rank.empty else '0')
         f2.metric('RS Positive', f'{positive_rs_stocks:,}')
@@ -1510,6 +2018,22 @@ try:
         st.markdown('#### Sector Radar')
         render_sector_radar_cards(top_sector_df, limit=8)
         st.caption('For the full sortable sector table, open **Sector Delivery + Volume**. The Overview intentionally shows only the decision-useful summary.')
+
+        # FPI MONEY PUSH SNAPSHOT — reads saved fortnightly data only, so Overview remains instant.
+        fpi_saved = load_fpi_history()
+        if not fpi_saved.empty:
+            _, fpi_quick = fpi_sector_summary(fpi_saved, 'Sector')
+            if not fpi_quick.empty:
+                st.markdown('#### FPI Sector Money Push · Fortnightly')
+                fq1, fq2 = st.columns([1.4, 1])
+                leaders = fpi_quick.head(5).copy()
+                with fq1:
+                    chart_fpi = leaders.set_index('Sector')['FPI Money Push Score']
+                    st.bar_chart(chart_fpi, use_container_width=True, height=260)
+                with fq2:
+                    q = leaders[['Sector','Latest Flow Cr','3F Net Flow Cr','FPI Money Push Score']].copy()
+                    st.dataframe(q.style.format({'Latest Flow Cr':'{:+,.0f}','3F Net Flow Cr':'{:+,.0f}','FPI Money Push Score':'{:.0f}'}), use_container_width=True, hide_index=True)
+                st.caption('Fortnightly FPI equity flow snapshot from saved depository data. Open **FPI Sector Money Push** for the continuous trend and flow-intensity view.')
 
         # ROTATION SNAPSHOT
         st.markdown('#### Sector Rotation Snapshot')
@@ -1553,7 +2077,7 @@ try:
             stock_show = top_stock_df.copy().head(10)
             stock_show['TradingView'] = stock_show['Symbol'].map(tradingview_url)
             # Overview stays compact; deeper evidence remains in Sector Stocks / Accumulation tabs.
-            radar_cols = ['Symbol','Signal','Entry Suitability Score','Accumulation Score','Sector','Today % Change','Latest Delivery %','Volume Spike x','RS vs N500 20D %','TradingView']
+            radar_cols = ['Symbol','Signal','Entry Suitability Score','Accumulation Score','Sector','Industry','Today % Change','Latest Delivery %','Delivery Acceleration','Volume Spike x','RS vs N500 20D %','TradingView']
             radar_cols = [c for c in radar_cols if c in stock_show.columns]
             render_frozen_grid(
                 stock_show[radar_cols],
@@ -1664,18 +2188,18 @@ try:
                 st.info('Choose one or more sectors to display the delivery chart.')
 
             st.markdown('**Sector opportunity ranking — delivery + volume + relative strength**')
-            rank_show = sector_opportunity.reset_index().rename(columns={'index': 'Industry'})
-            show_cols = ['Industry', 'Sector Opportunity Score', 'Delivery Z Score', 'Latest Delivery %', '5D Avg Delivery %', 'Sector Volume Spike x', 'Sector 5D Volume x', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', '5D Change']
+            rank_show = sector_opportunity.reset_index().rename(columns={'index': 'Sector'})
+            show_cols = ['Sector', 'Sector Opportunity Score', 'Delivery Z Score', 'Delivery Acceleration', 'Delivery Acceleration 5D', 'Latest Delivery %', '5D Avg Delivery %', 'Sector Volume Spike x', 'Sector 5D Volume x', 'Sector 20D Price %', 'Sector 5D Price %', 'Sector RS 20D %', 'Sector RS 5D %', '5D Change']
             show_cols = [c for c in show_cols if c in rank_show.columns]
             render_frozen_grid(
                 rank_show[show_cols],
-                pinned_left=['Industry','Sector Opportunity Score'],
+                pinned_left=['Sector','Sector Opportunity Score'],
                 score_columns=['Sector Opportunity Score'],
                 height=470,
                 key='sector_delivery_volume_grid',
             )
 
-            st.caption('Pinned columns stay visible while you scroll horizontally. Delivery Z above 0 means sector delivery is above its own recent normal; volume and RS must confirm before the opportunity score becomes strong.')
+            st.caption('Pinned columns stay visible while you scroll. Delivery Acceleration shows whether participation is increasing now; Delivery Z shows how unusual the level is. Volume and RS must confirm before the opportunity score becomes strong.')
 
     with tabs[4]:
         st.subheader('Sector relative strength vs NIFTY 500')
@@ -1700,8 +2224,8 @@ try:
                     line_chart_with_scale(rs_perf, 'Relative performance vs NIFTY 500 (%)', log_scale=False)
                     st.caption('0% is the start of the selected window. +3% means the sector has outperformed NIFTY 500 by about 3 percentage points over that window; negative values mean underperformance.')
 
-            rs_table = sector_opportunity.reset_index().rename(columns={'index': 'Industry'})
-            rs_cols = ['Industry', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', '5D Avg Delivery %', 'Sector Opportunity Score']
+            rs_table = sector_opportunity.reset_index().rename(columns={'index': 'Sector'})
+            rs_cols = ['Sector', 'Sector RS 20D %', 'Sector RS 5D %', 'Sector Volume Spike x', '5D Avg Delivery %', 'Delivery Acceleration', 'Sector Opportunity Score']
             rs_cols = [c for c in rs_cols if c in rs_table.columns]
             st.dataframe(rs_table[rs_cols].sort_values('Sector RS 20D %', ascending=False).style.format({
                 'Sector RS 20D %': '{:+.2f}',
@@ -1712,19 +2236,112 @@ try:
             }), use_container_width=True, hide_index=True)
 
     with tabs[5]:
+        st.subheader('FPI Sector Money Push — fortnightly institutional flow')
+        st.caption('Official sector-wise FPI data is published fortnightly by the depositories. This tab tracks equity net investment by sector through time and converts it into a normalized money-push signal.')
+
+        h = load_fpi_history()
+        cfa, cfb, cfc = st.columns([1.2,1,1])
+        reports_to_fetch = cfa.selectbox('History to refresh', [12,24,36,48], index=1, format_func=lambda x:f'{x} fortnights (~{x//2} months)', key='fpi_fetch_n')
+        if cfb.button('Refresh from CDSL', use_container_width=True, key='fpi_refresh'):
+            try:
+                with st.spinner('Downloading only missing fortnightly CDSL sector reports...'):
+                    h, added = refresh_fpi_history(reports_to_fetch)
+                st.success(f'FPI history refreshed. {added} new report(s) added.')
+                st.rerun()
+            except Exception as exc:
+                st.warning(f'Automatic refresh could not complete: {exc}')
+        with cfc:
+            if not h.empty:
+                st.metric('Latest FPI report', pd.to_datetime(h['Date']).max().strftime('%d %b %Y'))
+            else:
+                st.metric('Latest FPI report', 'Not loaded')
+
+        with st.expander('Manual import / data source', expanded=False):
+            st.markdown('If the depository site temporarily blocks automated requests, you can import a CSV with **Date, Source Sector, Net Equity Investment Cr**. Prior/Current AUC columns are optional but enable Flow Intensity.')
+            upl = st.file_uploader('Import FPI sector history CSV', type=['csv'], key='fpi_csv_upload')
+            if upl is not None and st.button('Import FPI CSV', key='fpi_csv_button'):
+                try:
+                    import_fpi_csv(upl)
+                    st.success('FPI history imported and saved.')
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+            st.link_button('Open CDSL FPI source', CDSL_FPI_INDEX)
+            st.link_button('Open NSDL FPI source', NSDL_FPI_PAGE)
+
+        h = load_fpi_history()
+        if h.empty:
+            st.info('No saved FPI sector history yet. Press **Refresh from CDSL** once. Later launches read the local history instantly; a web refresh is needed only when a new fortnight is published.')
+        else:
+            use_unified = st.radio('Sector view', ['Unified dashboard sectors','Original depository sectors'], horizontal=True, key='fpi_sector_view')
+            group_col = 'Sector' if use_unified.startswith('Unified') else 'Source Sector'
+            g, fsum = fpi_sector_summary(h, group_col)
+            if fsum.empty:
+                st.warning('FPI history exists but the sector summary could not be prepared.')
+            else:
+                # Headline rankings.
+                st.markdown('#### Current FPI sector ranking')
+                r1,r2,r3,r4 = st.columns(4)
+                top = fsum.iloc[0]
+                latest_leader = fsum.sort_values('Latest Flow Cr',ascending=False).iloc[0]
+                accel_leader = fsum.sort_values('Flow Acceleration Cr',ascending=False).iloc[0]
+                r1.metric('Strongest money-push trend', str(top[group_col]), f"Score {top['FPI Money Push Score']:.0f}")
+                r2.metric('Largest latest inflow', str(latest_leader[group_col]), f"₹{latest_leader['Latest Flow Cr']:+,.0f} Cr")
+                r3.metric('Fastest flow acceleration', str(accel_leader[group_col]), f"₹{accel_leader['Flow Acceleration Cr']:+,.0f} Cr")
+                r4.metric('Fortnights stored', f"{h['Date'].nunique():,}")
+
+                rank_cols=[group_col,'FPI Money Push Score','Latest Flow Cr','Latest Flow Intensity %','3F Net Flow Cr','6F Net Flow Cr','Positive Fortnights 6F %','Flow Acceleration Cr']
+                rank_cols=[c for c in rank_cols if c in fsum.columns]
+                render_frozen_grid(fsum[rank_cols], pinned_left=[group_col,'FPI Money Push Score'], score_columns=['FPI Money Push Score'], height=430, key='fpi_money_push_grid')
+
+                # Continuous trend charts.
+                flow = g.pivot(index='Date',columns=group_col,values='Net Flow Cr').sort_index()
+                intensity = g.pivot(index='Date',columns=group_col,values='Flow Intensity %').sort_index()
+                default_secs=[x for x in fsum[group_col].head(5).tolist() if x in flow.columns]
+                selected = st.multiselect('Sectors on continuous graph', options=flow.columns.tolist(), default=default_secs, key='fpi_graph_sectors')
+                trend_measure = st.radio('Trend measurement', ['Cumulative net equity flow (₹ Cr)','3-fortnight rolling net flow (₹ Cr)','Flow intensity (% of prior AUC)'], horizontal=True, key='fpi_trend_measure')
+                if selected:
+                    if trend_measure.startswith('Cumulative'):
+                        frame=flow[selected].fillna(0).cumsum()
+                        line_chart_with_scale(frame, 'Cumulative FPI net equity investment (₹ Cr)', log_scale=False, height=420)
+                        st.caption('A persistently rising line means repeated net FPI buying across fortnights; a falling line means persistent net selling.')
+                    elif trend_measure.startswith('3-fortnight'):
+                        frame=flow[selected].rolling(3,min_periods=1).sum()
+                        line_chart_with_scale(frame, 'Rolling 3-fortnight FPI net equity investment (₹ Cr)', log_scale=False, height=420)
+                        st.caption('This smooths one-off fortnightly noise and highlights sustained sector rotation.')
+                    else:
+                        frame=intensity[selected].rolling(2,min_periods=1).mean()
+                        line_chart_with_scale(frame, 'FPI flow intensity (% of prior sector AUC)', log_scale=False, height=420)
+                        st.caption('Flow intensity normalizes buying/selling by the sector’s existing FPI asset base, so very large sectors do not automatically dominate the chart.')
+
+                st.markdown('#### Latest fortnight — sector inflow / outflow')
+                latest_date=g['Date'].max()
+                latest=g[g['Date']==latest_date].sort_values('Net Flow Cr',ascending=False)
+                latest_chart=latest.set_index(group_col)['Net Flow Cr']
+                st.bar_chart(latest_chart, use_container_width=True, height=360)
+                st.caption(f"Latest available fortnight: {pd.to_datetime(latest_date).strftime('%d %b %Y')}. Positive bars = FPI net equity buying; negative bars = net selling.")
+
+                st.info('Interpretation: **FPI Money Push Score** combines latest normalized flow, 3-fortnight flow intensity, six-fortnight buying consistency and flow acceleration. Use it as a slow institutional sector trend layer alongside faster Sector RS + Delivery + Volume — not as a standalone buy signal.')
+                st.caption('Important: this module uses the depository-reported **net equity investment** field, not merely a change in AUC. AUC is retained only to normalize flow intensity.')
+
+    with tabs[6]:
         st.subheader('Stocks inside a selected sector')
         st.caption('Use the sector RS chart first, then drill into the stocks whose delivery, volume and stock-level RS are strengthening.')
         if stock_rank.empty:
             st.warning('Stock delivery data could not be loaded right now.')
         else:
             ranked_sectors = sector_opportunity.index.tolist() if not sector_opportunity.empty else []
-            all_mapped = sorted(stock_rank['Industry'].dropna().astype(str).unique().tolist())
-            sector_options = ranked_sectors + [x for x in all_mapped if x not in ranked_sectors]
-            chosen_sector = st.selectbox('Choose sector / industry', options=sector_options, key='sector_drilldown')
-            sector_stocks = stock_rank[stock_rank['Industry'] == chosen_sector].copy()
+            all_sectors = sorted(stock_rank['Sector'].dropna().astype(str).unique().tolist())
+            sector_options = ranked_sectors + [x for x in all_sectors if x not in ranked_sectors]
+            chosen_sector = st.selectbox('Choose sector', options=sector_options, key='sector_drilldown')
+            sector_stocks = stock_rank[stock_rank['Sector'] == chosen_sector].copy()
+            industry_options = ['All industries'] + sorted(sector_stocks['Industry'].dropna().astype(str).unique().tolist())
+            chosen_industry = st.selectbox('Industry within sector', options=industry_options, key='industry_drilldown')
+            if chosen_industry != 'All industries':
+                sector_stocks = sector_stocks[sector_stocks['Industry'] == chosen_industry].copy()
             sector_stocks = sector_stocks.sort_values(['Accumulation Score', 'Volume Spike x'], ascending=False)
             sector_stocks['TradingView'] = sector_stocks['Symbol'].map(tradingview_url)
-            show_cols = ['Symbol', 'Signal', 'Accumulation Score', 'Entry Suitability Score', 'Sector', 'Industry', 'Today % Change', 'Today Traded Value Cr', 'Latest Delivery %', 'Delivery Z', '20D Avg Delivery %', 'Volume Spike x', 'Volume Z', '5D Volume x', 'RS vs N500 20D %', 'RS vs N500 5D %', '1M Price Change %', '5D Price Change %', 'TradingView']
+            show_cols = ['Symbol', 'Signal', 'Accumulation Score', 'Entry Suitability Score', 'Sector', 'Industry', 'Today % Change', 'Today Traded Value Cr', 'Latest Delivery %', '5D Avg Delivery %', '20D Avg Delivery %', 'Delivery Z', 'Delivery Acceleration', 'Delivery Acceleration 5D', 'Volume Spike x', 'Volume Z', '5D Volume x', 'RS vs N500 20D %', 'RS vs Sector 20D %', 'RS vs Industry 20D %', 'RS vs N500 5D %', '1M Price Change %', '5D Price Change %', 'TradingView']
             show_cols = [c for c in show_cols if c in sector_stocks.columns]
             render_frozen_grid(
                 sector_stocks[show_cols],
@@ -1747,7 +2364,7 @@ try:
                     rs_line = rs_line.rolling(5).mean().rename(stock_choice).to_frame().tail(130)
                     line_chart_with_scale(rs_line, 'Stock RS vs NIFTY 500', log_scale=False, height=320)
 
-    with tabs[6]:
+    with tabs[7]:
         st.subheader('Opportunity Funnel — accumulation to entry')
         st.caption('Fast scan first, deeper checks later. The expensive Piotroski/news layer only runs on the final shortlist so broad NSE speed is preserved.')
         if stock_rank.empty:
@@ -1806,6 +2423,7 @@ try:
                 with st.spinner(f'Checking Piotroski + sector/industry for top {len(symbols)} candidates...'):
                     pio = enrich_piotroski(symbols)
                     prof = enrich_profiles(symbols)
+                    persist_profile_updates(prof)
                     quality = pio.merge(prof, on='Symbol', how='outer')
                     st.session_state['final_quality_data'] = quality
 
@@ -1816,6 +2434,7 @@ try:
                 filtered = filtered.drop(columns=['Piotroski F-Score','F-Score Coverage'], errors='ignore').merge(quality[pio_cols], on='Symbol', how='inner')
                 if len(prof_cols) > 1:
                     filtered = apply_profile_enrichment(filtered, quality[prof_cols])
+                    filtered = recompute_uniform_relative_strength(filtered)
                 filtered = filtered[filtered['Piotroski F-Score'].notna() & (filtered['Piotroski F-Score'] >= float(pi_min_score))].copy()
                 filtered = add_entry_scores(filtered, piotroski_floor=pi_min_score)
                 filtered['TradingView'] = filtered['Symbol'].map(tradingview_url)
@@ -1829,9 +2448,9 @@ try:
                 preferred = [
                     'Entry View','Opportunity Type','Symbol','Entry Suitability Score','Piotroski F-Score','Accumulation Score',
                     'Sector','Industry','Classification Source','Participation Conviction','Today % Change','Today Traded Value Cr',
-                    'Latest Delivery %','20D Avg Delivery %','Delivery Z','Delivery Acceleration',
+                    'Latest Delivery %','5D Avg Delivery %','20D Avg Delivery %','Delivery Z','Delivery Acceleration','Delivery Acceleration 5D',
                     'Volume Spike x','Volume Z','5D Volume x','Delivery Persistence 10D','Volume Persistence 10D',
-                    'RS vs N500 20D %','RS vs N500 5D %','RS Acceleration','RS vs Sector 20D %',
+                    'RS vs N500 20D %','RS vs N500 5D %','RS Acceleration','RS vs Sector 20D %','RS vs Industry 20D %',
                     'Distance to 20D High %','Price Extension vs 20DMA %','Volatility Contraction',
                     '1M Price Change %','5D Price Change %','Extension Penalty','F-Score Coverage','TradingView'
                 ]
@@ -1861,8 +2480,25 @@ try:
             st.caption('Key interpretation: positive Delivery/Volume Z means activity is unusually high for that stock; RS Acceleration identifies improving leadership; values below 1.0 in Volatility Contraction indicate short-term volatility is contracting versus its 20-day norm. Piotroski is a selectable quality gate, not the trigger.')
 
 
+    with tabs[8]:
+        st.subheader('Master stock classification')
+        st.caption('Every dashboard tab reads the same canonical Stock → Industry → Sector mapping. Use this page to inspect coverage and identify any remaining unmapped names.')
+        class_view = meta[['Symbol','Sector','Industry','Classification Source']].copy() if not meta.empty else pd.DataFrame()
+        if class_view.empty:
+            st.info('Classification map is not available yet.')
+        else:
+            class_view['Status'] = np.where(class_view['Sector'].notna() & class_view['Industry'].notna(), 'Mapped', 'Unmapped')
+            cm1, cm2, cm3 = st.columns(3)
+            cm1.metric('Universe', f'{len(class_view):,}')
+            cm2.metric('Mapped', f"{int((class_view['Status']=='Mapped').sum()):,}")
+            cm3.metric('Unmapped', f"{int((class_view['Status']=='Unmapped').sum()):,}")
+            map_filter = st.radio('Show', ['All','Mapped','Unmapped'], horizontal=True, key='classification_filter')
+            show_map = class_view if map_filter == 'All' else class_view[class_view['Status'] == map_filter]
+            render_frozen_grid(show_map, pinned_left=['Symbol','Sector','Industry'], height=520, key='classification_master_grid')
+            st.caption('If some broad-NSE stocks remain unmapped, use **Classification quality → Map next unmapped batch** in the sidebar. The result is saved and reused on later launches.')
 
-    with tabs[7]:
+
+    with tabs[9]:
         st.subheader('Stock news support')
         st.caption('Use news as confirmation, not as a substitute for the delivery + volume + RS signal.')
         if stock_rank.empty:

@@ -1,10 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title Market Regime Dashboard Launcher
+title Market Intelligence Terminal Launcher
 
 echo ================================================
-echo      MARKET REGIME DASHBOARD - LAUNCHER
+echo      MARKET INTELLIGENCE TERMINAL - LAUNCHER
 echo ================================================
 echo.
 echo Working folder: %CD%
